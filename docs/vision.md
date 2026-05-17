@@ -1,6 +1,3 @@
-The vision.md file isn't on disk. I'm going to give you the content directly. Please create the file at docs/vision.md with exactly the following content (replace the .gitkeep currently in docs/, but keep .gitkeep files in docs/decisions/ and docs/planning/ intact):
-
-```
 # Vibe Manager — Vision Brief
 
 ## What this is
@@ -147,10 +144,3 @@ These are flagged for the planning stage, not pre-decided:
 ## Founder context for the agents
 
 The operator is a solo founder, currently full-time on Vibe Manager while matome.ai is paused pending CASA Tier 2 clearance. Background is newsletter/lifecycle email marketing, not traditional software engineering — comfortable with agentic workflows but expects the agents to handle implementation depth. Communication preference: direct, prose, minimal filler, honest pushback over validation. The agents should not over-explain, ask permission for routine technical choices, or pad responses with caveats.
-```
-
-After creating the file, commit on Arcadiann/london with the message "Add vision brief" and push to main via:
-
-git push origin Arcadiann/london:main
-
-Confirm the file is in docs/, the commit succeeded, and the push completed.
