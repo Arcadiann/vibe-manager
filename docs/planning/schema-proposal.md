@@ -4,7 +4,7 @@ Proposal only — no SQL files, no migrations. This document is the design surfa
 
 All tables live in a dedicated schema `vibe_manager`, never `public`. The orchestrator opens connections with `search_path = vibe_manager, public` so referencing `extensions.vector` from the `public` schema works without leaking app tables.
 
-Three tables: `tasks`, `memory`, `events`.
+Three tables plus one join table: `tasks`, `task_dependencies`, `memory`, `events`.
 
 ---
 
@@ -20,17 +20,17 @@ Tracks every unit of work the orchestrator is aware of, from root task (the oper
 | `title` | `text` | no | — | One-line summary, agent-authored. |
 | `description` | `text` | no | — | Full task prompt / spec. |
 | `success_criteria` | `text` | yes | — | What "done" means for this task; passed to worker. |
-| `status` | `task_status` | no | `'pending'` | Enum: `pending`, `assigned`, `running`, `blocked`, `complete`, `failed`, `cancelled`. |
+| `status` | `text` | no | `'pending'` | One of `pending`, `assigned`, `running`, `blocked`, `complete`, `failed`, `cancelled`. Enforced by `CHECK (status IN (...))`. Text not enum so we can add states without an `ALTER TYPE`. |
 | `status_reason` | `text` | yes | — | Free-form, set whenever status moves to a terminal or blocked state. |
 | `created_by_agent` | `text` | no | — | `'vision'`, `'manager'`, `'worker:<id>'`, or `'human'` for root. |
 | `assigned_worker_type` | `text` | yes | — | E.g. `'claude-code'`. Null until assigned. |
 | `assigned_session_handle` | `text` | yes | — | Opaque `WorkerAgent` session handle once started. |
-| `depends_on` | `uuid[]` | no | `'{}'` | Sibling task IDs that must reach `complete` before this can run. See open question below. |
 | `task_spec` | `jsonb` | yes | — | Full `TaskSpec` payload sent to the worker (frozen at assignment time). |
 | `result` | `jsonb` | yes | — | Worker's structured completion payload. |
 | `error` | `jsonb` | yes | — | Structured error if `status = failed`. |
-| `token_budget_cents` | `integer` | yes | — | Per-task hard cap in cents. Null = inherit from parent or global default. |
-| `tokens_spent_cents` | `integer` | no | `0` | Updated by orchestrator from worker events. Computed-on-write rather than recomputed-on-read because workers stream events fast. |
+| `budget_fidelity` | `text` | no | `'high'` | One of `high`, `low`. Set by the orchestrator based on the worker's token-reporting cadence (see ADR-0001). `CHECK (budget_fidelity IN ('high','low'))`. |
+| `token_budget_cents` | `bigint` | yes | — | Per-task hard cap in cents. Null = inherit from parent or global default. |
+| `tokens_spent_cents` | `bigint` | no | `0` | Updated by orchestrator from worker events. Computed-on-write rather than recomputed-on-read because workers stream events fast. `bigint` rather than `integer` to give headroom (an integer caps at \~\$21M of cumulative spend; cheap insurance against subtree-level accumulator overflow in long-running roots). |
 | `attempt_count` | `smallint` | no | `0` | Increment on retry. |
 | `created_at` | `timestamptz` | no | `now()` | |
 | `started_at` | `timestamptz` | yes | — | First transition to `running`. |
@@ -40,12 +40,38 @@ Tracks every unit of work the orchestrator is aware of, from root task (the oper
 - `tasks_parent_idx` on `(parent_task_id)` — list children of a node.
 - `tasks_root_idx` on `(root_task_id)` — fetch full subtree for a user-visible run.
 - `tasks_status_idx` on `(status)` `where status in ('pending','assigned','running','blocked')` — partial index over the small hot set.
-- `tasks_depends_on_gin` GIN on `(depends_on)` — find unblocked tasks (`where not depends_on && unfinished_set`). Worth measuring before committing.
 
 **Non-obvious column rationale.**
 - **`root_task_id`** avoids `WITH RECURSIVE` on every "show me this run" query. Slightly redundant but cheap to maintain.
 - **`task_spec`** is frozen at assignment so the audit trail is reproducible even if the orchestrator changes how it builds specs.
-- **`tokens_spent_cents` as integer** sidesteps numeric precision issues; integer cents is the standard.
+- **`status` and `budget_fidelity` as text + `CHECK`** match the rationale already given for `events.kind`: small, evolving vocabularies, and we don't want an `ALTER TYPE` every time we add a state.
+- **`tokens_spent_cents` as bigint** — see column note. Integer is too tight for subtree accumulation in long-running operator sessions.
+
+**No row-level concurrency control.** This schema has no `version` column, no `xmin` checks, no optimistic-locking ceremony. v1 runs a single orchestrator process; row writes are serialized at the orchestrator layer, not the database. This is intentional and consciously forecloses two things: (a) running multiple concurrent orchestrators against the same database (they'd race on `tasks.status` transitions with no detection), and (b) hand-editing rows via Supabase Studio during a live run (could collide with an in-flight transition). Both are acceptable losses for v1. If we ever need either, add a `version integer` column and bump it on every `UPDATE`.
+
+---
+
+## `vibe_manager.task_dependencies`
+
+Join table expressing "task A cannot start until task B reaches `complete`." One row per edge.
+
+| Column | Type | Null | Default | Notes |
+|---|---|---|---|---|
+| `task_id` | `uuid` | no | — | FK → `tasks.id` `on delete cascade`. The dependent task. |
+| `depends_on_task_id` | `uuid` | no | — | FK → `tasks.id` `on delete cascade`. The upstream task that must complete first. |
+| `created_at` | `timestamptz` | no | `now()` | |
+
+**Primary key:** `(task_id, depends_on_task_id)`.
+
+**Constraints.**
+- `CHECK (task_id <> depends_on_task_id)` — no self-loops.
+- Cycle detection is enforced at the orchestrator layer when the Manager Agent emits a graph; not enforced in SQL.
+
+**Indexes.**
+- The PK already covers `(task_id, depends_on_task_id)` — sufficient for "what does this task wait on?"
+- `task_dependencies_reverse_idx` on `(depends_on_task_id)` — for "what tasks does this unblock when it completes?" The orchestrator runs this query on every task completion to advance ready successors.
+
+**Rationale for join table over `uuid[]`.** Real FKs (both ends), trivially enumerable in either direction, no array gymnastics in queries, and a clean place to attach future per-edge metadata (e.g., `edge_kind` for hard-vs-soft dependencies) without a column migration on `tasks`.
 
 ---
 
@@ -60,8 +86,8 @@ Depends on the `vector` extension (already available on Supabase).
 | `id` | `uuid` | no | `gen_random_uuid()` | PK |
 | `content` | `text` | no | — | The human-readable text that was embedded. Always present alongside the vector. |
 | `summary` | `text` | yes | — | Optional one-line title (helps debugging without re-reading `content`). |
-| `embedding` | `vector(1536)` | no | — | See open question on dimension. |
-| `embedding_model` | `text` | no | — | E.g. `'text-embedding-3-small'`. Stored per-row so we can re-embed on model swaps without losing provenance. |
+| `embedding` | `vector(3072)` | no | — | Dimension fixed to match `text-embedding-3-large` (the chosen embedding model for v1). |
+| `embedding_model` | `text` | no | `'text-embedding-3-large'` | Stored per-row so we can re-embed on model swaps without losing provenance, and so heterogeneous rows (during a future migration) are still traceable to the model that produced them. |
 | `kind` | `text` | no | — | Loose taxonomy: `'lesson'`, `'fact'`, `'codebase-quirk'`, `'decision'`, `'preference'`. Not an enum so we can evolve without a migration. |
 | `created_by_agent` | `text` | no | — | Which agent wrote this memory. |
 | `task_id` | `uuid` | yes | — | FK → `tasks.id` `on delete set null`. The task this memory came from, if any. |
@@ -70,13 +96,13 @@ Depends on the `vector` extension (already available on Supabase).
 | `last_used_at` | `timestamptz` | yes | — | Updated whenever a retrieval surfaces this row. Lets us prune dead memories later. |
 
 **Indexes.**
-- `memory_embedding_hnsw` HNSW on `(embedding vector_cosine_ops)` — primary retrieval path. HNSW preferred over IVFFlat for read-heavy semantic search at small-to-mid scale.
+- `memory_embedding_hnsw` HNSW on `(embedding halfvec_cosine_ops)` — primary retrieval path. Note: pgvector's HNSW index over the full-precision `vector` type currently caps at 2000 dimensions. At 3072 dims we either build the HNSW over a `halfvec(3072)` cast of the embedding (preferred — halves storage, negligible recall loss for this use case) or fall back to IVFFlat. Proposal: store the column as `vector(3072)` for round-trip fidelity, index a `halfvec` expression. Confirm pgvector version on Supabase supports halfvec ≥ 0.7.0 before committing in M2.
 - `memory_metadata_gin` GIN on `(metadata jsonb_path_ops)` — filtered retrieval (e.g., `metadata @> '{"repo": "matome"}'`).
 - `memory_kind_idx` on `(kind)` — filter by memory kind.
 - `memory_task_idx` on `(task_id)` — find all memories from a given task.
 
 **Non-obvious column rationale.**
-- **`embedding_model`** is essential: mixing dimensions or model versions in one HNSW index destroys recall. When the model changes, we backfill, we don't merge.
+- **`embedding_model`** is essential: mixing dimensions or model versions in one HNSW index destroys recall. When the model changes, we backfill, we don't merge. Default `'text-embedding-3-large'` codifies the v1 choice; rows produced by other models (e.g., during a future migration) MUST override the default explicitly.
 - **`last_used_at`** is the only mutable column. Tracks which memories actually pay rent.
 
 ---
@@ -113,21 +139,20 @@ Append-only audit log. Every decision, delegation, escalation, tool call, and wo
 
 ---
 
-## Vision-brief ambiguities flagged
+## Vision-brief ambiguities (resolved here)
 
-These are places the vision brief is unclear about what should be persisted vs. computed. None block the proposal, but each is worth a 60-second decision before M2.
+The vision brief left several persistence-vs-computation choices unspecified. Resolutions:
 
-1. **Memory writes — automatic or explicit?** The brief says memory is "available to all agents on read" but doesn't say who writes and when. The schema supports either path. Implication: M4 has to decide whether agents emit `remember(...)` calls explicitly or whether a post-task summarizer runs on every completion.
-2. **Per-task budget accounting.** The brief specifies a $20/task default in the router rubric but doesn't define whether token cost is tracked at the worker level only, the subtree level (parent + descendants), or both. The schema lets us do either; orchestrator needs to pick. Proposal: track at the task level, compute subtree totals on demand from `root_task_id`.
-3. **Worker output streaming destination.** Vision question #2. The schema captures worker output via `events` (kind=`worker_event`) regardless of transport; the streaming mechanism is an M3 implementation choice, not a schema choice.
-4. **Dependencies as array vs. join table.** `depends_on uuid[]` is simpler and adequate for v1 task graphs (expected < 50 nodes per run). A join table would scale better but isn't necessary yet. Flagging because it's the kind of decision that's annoying to reverse — but reversible with a one-shot migration. Recommend array for now.
-5. **Memory dimension.** `vector(1536)` matches OpenAI's `text-embedding-3-small`. If we want to use Voyage (`voyage-3` is 1024) or `text-embedding-3-large` (3072), we change the column type. The `embedding_model` column is forward-compatible; the dimension is not. Suggest deciding before M4.
+1. **Memory writes — automatic AND explicit.** Both paths land. A post-task summarizer runs at task completion and writes any extractable lessons. Agents may additionally call an orchestrator-side `remember(...)` callable to deliberately persist a discovery they want surfaced later. The schema accommodates both via `created_by_agent` and `kind`.
+2. **Per-task budget accounting.** Tracked at the task level via `tasks.tokens_spent_cents`. Subtree totals (parent + all descendants) are computed on demand from `root_task_id` rather than denormalized — this avoids cascading writes on every leaf-task update and matches how the operator-facing dashboards will actually query.
+3. **Worker output streaming destination.** Vision question #2. The schema captures worker output via `events` (kind=`worker_event`) regardless of transport; the streaming mechanism is an ADR-0001 implementation choice, not a schema choice.
+4. **Dependencies (resolved).** Now a `task_dependencies` join table, not an array column.
+5. **Embedding dimension (resolved).** `vector(3072)`, model `text-embedding-3-large`.
 6. **Soft-deletes.** Nothing in this proposal has a `deleted_at` column. The brief is silent on retention. If we ever want to "forget" a task (e.g., legal), we need either hard delete with cascades or a soft-delete flag. Defer until someone asks.
 
 ---
 
 ## Open questions
 
-- Dimension for the embedding column (1024 / 1536 / 3072 — depends on embedding model choice).
 - Whether to enforce append-only on `events` via trigger now or trust orchestrator code for v1.
-- Whether `depends_on` should be a join table now (cheap insurance) or `uuid[]` (simpler, reversible).
+- Whether the post-task memory summarizer should run synchronously at task completion or as a deferred background job (affects perceived task latency and operator-visible state).

@@ -74,7 +74,7 @@ interface WorkerAgent {
 - `start` returns once the worker has accepted the task and is ready to stream — not when the task is complete. The orchestrator immediately calls `stream()` to consume events.
 - `status` is a cheap, side-effect-free poll. Used for health checks and reconciliation after orchestrator restart.
 - `stream` is the primary observation channel; see below.
-- `stop` requests cleanup. Best-effort, with a contract: workers SHOULD stop within `STOP_GRACE_MS` (default 10s) or the orchestrator considers them leaked.
+- `stop` requests cleanup. The contract is stronger than best-effort: **after `stop()` resolves or after `STOP_GRACE_MS` (default 10s) elapses, whichever comes first, the worker MUST NOT emit any further `tokens` events.** Other event kinds (`log`, `failed`, terminal events emitted in-flight) may still arrive briefly, but token reporting must be authoritatively halted. Budget enforcement depends on this. Each implementation chooses how to honor it (for `ClaudeCodeWorker`, this is a process-group SIGKILL on Unix after the grace window).
 
 ### Status reports
 
@@ -106,7 +106,11 @@ type WorkerEvent =
 
 - Workers MUST emit at least one event per `HEARTBEAT_INTERVAL_MS` (default 30s). If not, the orchestrator considers the worker zombied and calls `stop()`.
 - The stream MUST terminate exactly once, by emitting either `complete` or `failed`, OR by closing the iterator without either (which the orchestrator treats as `failed` with synthetic reason `stream_closed_without_terminal`).
-- `tokens` events are how the orchestrator updates `tasks.tokens_spent_cents`. Workers that don't have token granularity emit a single `tokens` event at completion.
+- `tokens` events are how the orchestrator updates `tasks.tokens_spent_cents`. Token reporting frequency has two compliance paths, and workers MUST pick one:
+  - **High-fidelity path.** Emit a `tokens` event at least every 10 seconds of running time OR every 5,000 output tokens, whichever comes first. The orchestrator can enforce per-task budget caps with near-real-time precision against these workers.
+  - **Low-fidelity path.** Emit `tokens` events less often or only at completion. The orchestrator MUST mark the task with `budget_fidelity = 'low'`, MUST NOT terminate the worker mid-run on cap breach (the data isn't there to do so reliably), and reconciles the actual spend after the fact. Suitable for workers whose underlying systems don't surface incremental token counts.
+- A worker declares its path implicitly by its event cadence; the orchestrator infers the path from the first 30 seconds of activity and from `complete` event data. Workers that intend the high-fidelity path but fail to emit at the required cadence are downgraded by the orchestrator to low-fidelity for the rest of the run and a `log` event at `warn` is recorded.
+- **Back-pressure (resolved).** If the orchestrator consumes events more slowly than the worker produces them, the worker MUST block on the stream rather than buffer unboundedly, drop events, or fail. Heartbeats are not exempt — they queue behind real events. Workers SHOULD prefer coarser event granularity over selective dropping if back-pressure is sustained.
 
 ### Error semantics
 
@@ -118,6 +122,9 @@ type WorkerEvent =
 | **Garbage output** | Not the worker's job to detect. | Orchestrator validates against `successCriteria` post-hoc; treats as `failed` if validation rejects. |
 | **Partial completion** | Worker emits `complete` with `partial: true` | Treated as `complete` for accounting, but flagged in `tasks.result.partial`. Manager Agent decides whether to re-task. |
 | **Recoverable failure** | Worker emits `failed` with `recoverable: true` | Retry without escalation; non-recoverable failures escalate after N attempts. |
+| **Budget cap breach (high-fidelity worker)** | `tokens_spent_cents` exceeds `token_budget_cents` mid-run | Orchestrator calls `stop()`; per the strengthened `stop()` contract, no further `tokens` events arrive after the grace window, so the cap is honored. Records as `failed` with reason `budget_exceeded`. |
+| **Stop unresponsive** | `stop()` does not resolve and `STOP_GRACE_MS` elapses | Orchestrator treats the session as terminated for accounting purposes (no further `tokens` events accepted), records `failed` with reason `stop_timeout`, and surfaces a structured error. Implementation MUST force-terminate underlying resources (e.g., process-group SIGKILL) before this point. |
+| **Protocol version mismatch** | Orchestrator finds `capabilities().protocolVersion` outside its supported range | Orchestrator refuses to call `start()` on this worker, writes a structured `worker_rejected` event to `vibe_manager.events` with the observed and supported versions, and surfaces the worker as unusable. Not a runtime failure mode but specified here for completeness. |
 
 The contract is: **the worker reports what it knows; the orchestrator decides what it means.** Workers don't decide whether they should be retried, escalated, or replaced.
 
@@ -128,7 +135,7 @@ The contract is: **the worker reports what it knows; the orchestrator decides wh
 - **`start()`.** Creates a Conductor worktree, writes `TaskSpec` to a known location inside the worktree, spawns `claude` as a subprocess with structured-output flags. Returns a session handle (e.g., `claude-code:<pid>:<uuid>`).
 - **`stream()`.** Tails the subprocess's structured stdout, parses each line into a `WorkerEvent`. Anything that doesn't parse becomes a `log` event at `warn`. Emits a synthetic `heartbeat` if no upstream event in 25s.
 - **`status()`.** Checks process liveness and last-event timestamp.
-- **`stop()`.** Sends SIGTERM, waits `STOP_GRACE_MS`, then SIGKILL. Cleans up the worktree (or marks it for reaping; see M3 open question).
+- **`stop()`.** Sends SIGTERM to the subprocess, waits `STOP_GRACE_MS`, then SIGKILL to the entire process group (to catch any subprocesses Claude Code itself spawned). This is how `ClaudeCodeWorker` honors the contract's "no further `tokens` events after grace" requirement. Cleans up the worktree (or marks it for reaping; see M3 open question).
 
 ## How a future `CodexWorker` satisfies the interface
 
@@ -161,14 +168,14 @@ This interface deliberately does not promise:
 
 4. **Richer capabilities (e.g., `canEditFiles: boolean`, `supportsSubagents: boolean`).** Rejected for v1: speculative. We don't yet know which capability flags actually matter for orchestrator routing. Add fields when a real routing decision requires one.
 
-5. **Workers as long-lived agents that accept multiple tasks over their lifetime.** Rejected: one-task-per-session is simpler, matches how Claude Code subprocesses naturally work, and avoids state leakage between unrelated tasks. We can add session reuse later if startup cost dominates (it doesn't, today).
+5. **Pinning session lifetime in the contract (e.g., one-task-per-session or long-lived multi-task sessions).** Rejected: the contract is silent on session lifetime. `start()` accepts one `TaskSpec` and returns one `SessionHandle`; whether the underlying process/connection is fresh per call, pooled, or persistent across many `start()` calls is an implementation choice. `ClaudeCodeWorker` happens to spawn a fresh subprocess per `start()` (one-task-per-session in practice), but that is not promised by the interface and other workers may legitimately reuse a session for warm-startup or shared context.
 
 ## Claude-specific behavior to call out (so we don't smuggle it in)
 
 These are properties of `ClaudeCodeWorker` that other workers might NOT share. The interface accommodates the variation:
 
 - Claude Code emits explicit `tool_call` / `tool_result` events. Other workers may not — those would emit `log` events instead, or coarse `progress`. The orchestrator MUST NOT assume every worker emits structured tool calls.
-- Claude Code reports token usage continuously. Other workers may only report at completion. The interface allows either by leaving emission frequency unspecified, only requiring `tokens` events exist.
+- Claude Code reports token usage continuously and qualifies for the high-fidelity token-reporting path. Other workers may only report at completion and run in the low-fidelity path; the interface accommodates either explicitly (see Event stream above).
 - Claude Code runs in a Conductor worktree by convention. Other workers may not use Conductor. `TaskSpec.workingDirectory` is a hint, not a contract.
 - Claude Code's `partial: true` semantics map to "I stopped at the token cap with useful work done." Other workers may interpret partial differently; `tasks.result.partial` is a hint to the Manager Agent, not a typed promise.
 
@@ -177,8 +184,5 @@ These are properties of `ClaudeCodeWorker` that other workers might NOT share. T
 Flagged, not silently decided.
 
 1. **Stream transport.** In-process `AsyncIterable<WorkerEvent>` works for v1 (orchestrator + worker share a process). When workers go out-of-process (cloud), do we go file-tail, gRPC stream, or something else? Pick when forced.
-2. **`stop()` guarantee strength.** Currently "best-effort within `STOP_GRACE_MS`." Should we promise stronger termination (e.g., process group kill on Unix) at the interface level, or leave that to each implementation?
-3. **Capability sync vs. async.** `capabilities()` is synchronous now. If a future worker needs to query a backend to know its model (e.g., the user-configured Cursor account's tier), we'd have to break this. Acceptable risk vs. complicating the orchestrator now?
-4. **Streaming back-pressure.** What happens when the orchestrator can't consume events fast enough? Drop heartbeats? Buffer? Block the worker? Probably block; flagging.
-5. **Worker self-restart.** If a worker detects an internally recoverable condition (e.g., rate limit), can it pause and retry inside one `start()` call, or must it `failed(recoverable: true)` and let the orchestrator re-task? Current proposal: prefer the latter for observability, but allow brief internal retries for transient API errors.
-6. **Schema versioning of `WorkerEvent`.** `protocolVersion` is in `capabilities()`, but we haven't decided what the orchestrator does on a mismatch. Refuse to use the worker? Downgrade-and-warn? Defer until we change the protocol.
+2. **Capability sync vs. async.** `capabilities()` is synchronous now. If a future worker needs to query a backend to know its model (e.g., the user-configured Cursor account's tier), we'd have to break this. Acceptable risk vs. complicating the orchestrator now?
+3. **Worker self-restart.** If a worker detects an internally recoverable condition (e.g., rate limit), can it pause and retry inside one `start()` call, or must it `failed(recoverable: true)` and let the orchestrator re-task? Current proposal: prefer the latter for observability, but allow brief internal retries for transient API errors.
