@@ -33,7 +33,7 @@ Eight milestones (six numbered slots, two pairs split into a/b). M1 is the small
 
 **Goal.** Replace in-memory state with the Postgres-backed `tasks`, `task_dependencies`, `memory`, `events` schema, and give the operator the live read-paths they'll need to trust the system.
 
-**Scope.** Apply the schema (proposed in [schema-proposal.md](schema-proposal.md)) on the existing Supabase project under the `vibe_manager` schema. Wire the orchestrator so every state transition writes an event; tasks are read/updated through the table; memory is written but not yet retrieved (retrieval lands in M4b). Ship three operator-facing CLI commands: `vibe status <root_task_id>` (current tree state — every task in the subtree with status, assigned worker, tokens spent), `vibe tail <root_task_id>` (live event stream from `events` for that run, filtered by `root_task_id`, tailing as new rows arrive), and `vibe replay <root_task_id>` (deterministic ordered reconstruction of the run from events).
+**Scope.** Apply the schema (proposed in [schema-proposal.md](schema-proposal.md)) on the existing Supabase project under the `vibe_manager` schema. Wire the orchestrator so every state transition writes an event; tasks are read/updated through the table; memory is written but not yet retrieved (retrieval lands in M4b). Ship three operator-facing CLI commands: `vibe status <root_task_id>` (current tree state — every task in the subtree with status, assigned worker, tokens spent), `vibe tail <root_task_id>` (live event stream from `events` for that run, filtered by `root_task_id`, tailing as new rows arrive via Postgres `LISTEN/NOTIFY` on insert — single-instance v1, no polling), and `vibe replay <root_task_id>` (deterministic ordered reconstruction of the run from events).
 
 **Acceptance criteria.**
 - M1's haiku flow still works, now backed by Postgres.
@@ -50,7 +50,6 @@ Eight milestones (six numbered slots, two pairs split into a/b). M1 is the small
 
 **Open questions.**
 - Mid-task crash policy: auto-resume on restart, or always mark failed and let the operator re-file? (Vision brief doesn't say.)
-- `vibe tail` transport: `LISTEN/NOTIFY` on insert into `events`, polling, or logical replication? (Defer to the M2 implementer.)
 
 ---
 
@@ -103,7 +102,7 @@ Eight milestones (six numbered slots, two pairs split into a/b). M1 is the small
 
 **Goal.** Manager Agent decomposes work into a real task graph and the orchestrator runs ready tasks in parallel under a dependency-aware scheduler.
 
-**Scope.** Manager Agent prompt is upgraded to produce a task graph (N tasks with explicit edges expressed as `task_dependencies` rows) instead of a single task. Orchestrator runs ready tasks (tasks whose upstream dependencies are all `complete`) in parallel up to a configurable concurrency limit. Manager receives worker outputs and synthesizes a final parent-task result. No memory retrieval yet — that's M4b.
+**Scope.** Manager Agent prompt is upgraded to produce a task graph (N tasks with explicit edges expressed as `task_dependencies` rows) instead of a single task. Orchestrator runs ready tasks (tasks whose upstream dependencies are all `complete`) in parallel up to a configurable concurrency limit — default 2 for v1, to be tuned upward if M4a shows the Manager produces genuinely independent tasks. Manager receives worker outputs and synthesizes a final parent-task result. No memory retrieval yet — that's M4b.
 
 **Acceptance criteria.**
 - A task that obviously decomposes (e.g., "add a test, then a fixture, then refactor X to use the fixture") runs as ≥3 distinct task rows with correctly-populated `task_dependencies` edges.
@@ -117,7 +116,6 @@ Eight milestones (six numbered slots, two pairs split into a/b). M1 is the small
 **Dependencies.** M3b.
 
 **Open questions.**
-- Concurrency cap default value (vision question #6). Suggest starting at 2 and tuning from real usage.
 - How does the Manager know when it's "done" and synthesis should fire — explicit termination event from the worker, or graph-completion check on the orchestrator side?
 
 ---
@@ -149,7 +147,7 @@ Eight milestones (six numbered slots, two pairs split into a/b). M1 is the small
 
 **Goal.** Vision Agent becomes a real binary classifier; escalations land in the founder's Slack DM with enough context for a 5-minute decision.
 
-**Scope.** Implement the decision router as a Claude call against the rubric in the vision brief, outputting `{escalate, reason, urgency}`. On `escalate: true`, format a Slack DM with: original task, what the agent wants to do, why this is flagged, links to relevant events/diff, and reply options. The system pauses the affected task branch until the operator replies. Reply mechanism is Slack reactions (✅ proceed, ❌ stop, ❓ ask-for-more-context) plus optional free-form text in-thread for nuance. No SMS fallback — deferred to post-MVP.
+**Scope.** Implement the decision router as a Claude call against the rubric in the vision brief, outputting `{escalate, reason, urgency}`. On `escalate: true`, format a Slack DM with: original task, what the agent wants to do, why this is flagged, links to relevant events/diff, and reply options. The system pauses the affected task branch indefinitely until the operator replies — single-user system, no second channel, no auto-timeout. Reply mechanism is Slack reactions (✅ proceed, ❌ stop, ❓ ask-for-more-context) plus optional free-form text in-thread for nuance. No SMS fallback — deferred to post-MVP. Revisit indefinite-pause behavior if pending escalations become an operational issue during dogfooding.
 
 **Acceptance criteria.**
 - A task that touches `auth.*` files triggers an escalation; a task that renames an internal variable does not.
@@ -164,7 +162,6 @@ Eight milestones (six numbered slots, two pairs split into a/b). M1 is the small
 
 **Open questions.**
 - Slack escalation message format (vision question #4) — needs design work; suggest one round of iteration during M5.
-- Default behavior when no operator reply arrives — does the task stay paused indefinitely, or is there a max-pause timeout? (Without SMS fallback, there's no escalation-of-the-escalation, so the answer matters.)
 
 ---
 

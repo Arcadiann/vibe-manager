@@ -86,7 +86,7 @@ Depends on the `vector` extension (already available on Supabase).
 | `id` | `uuid` | no | `gen_random_uuid()` | PK |
 | `content` | `text` | no | — | The human-readable text that was embedded. Always present alongside the vector. |
 | `summary` | `text` | yes | — | Optional one-line title (helps debugging without re-reading `content`). |
-| `embedding` | `vector(3072)` | no | — | Dimension fixed to match `text-embedding-3-large` (the chosen embedding model for v1). |
+| `embedding` | `halfvec(3072)` | no | — | Dimension fixed to match `text-embedding-3-large` (the chosen embedding model for v1). `halfvec` (16-bit per component) rather than `vector` so HNSW indexing works out of the box at 3072 dims; storage halves with negligible recall loss at this scale. |
 | `embedding_model` | `text` | no | `'text-embedding-3-large'` | Stored per-row so we can re-embed on model swaps without losing provenance, and so heterogeneous rows (during a future migration) are still traceable to the model that produced them. |
 | `kind` | `text` | no | — | Loose taxonomy: `'lesson'`, `'fact'`, `'codebase-quirk'`, `'decision'`, `'preference'`. Not an enum so we can evolve without a migration. |
 | `created_by_agent` | `text` | no | — | Which agent wrote this memory. |
@@ -96,7 +96,7 @@ Depends on the `vector` extension (already available on Supabase).
 | `last_used_at` | `timestamptz` | yes | — | Updated whenever a retrieval surfaces this row. Lets us prune dead memories later. |
 
 **Indexes.**
-- `memory_embedding_hnsw` HNSW on `(embedding halfvec_cosine_ops)` — primary retrieval path. Note: pgvector's HNSW index over the full-precision `vector` type currently caps at 2000 dimensions. At 3072 dims we either build the HNSW over a `halfvec(3072)` cast of the embedding (preferred — halves storage, negligible recall loss for this use case) or fall back to IVFFlat. Proposal: store the column as `vector(3072)` for round-trip fidelity, index a `halfvec` expression. Confirm pgvector version on Supabase supports halfvec ≥ 0.7.0 before committing in M2.
+- `memory_embedding_hnsw` HNSW on `(embedding halfvec_cosine_ops)` — primary retrieval path. The column is `halfvec(3072)` directly (not a `vector(3072)` indexed via expression), so HNSW works without ceremony. M2 confirms the Supabase pgvector version is ≥ 0.7.0 (halfvec support) before applying the migration.
 - `memory_metadata_gin` GIN on `(metadata jsonb_path_ops)` — filtered retrieval (e.g., `metadata @> '{"repo": "matome"}'`).
 - `memory_kind_idx` on `(kind)` — filter by memory kind.
 - `memory_task_idx` on `(task_id)` — find all memories from a given task.
