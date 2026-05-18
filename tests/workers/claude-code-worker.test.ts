@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import {
   ClaudeCodeWorker,
   MISSING_API_KEY_MESSAGE,
+  buildSpawnEnv,
   buildSpawnPlan,
   resolveApiKey,
 } from '../../src/workers/claude-code-worker.ts'
@@ -59,11 +60,10 @@ describe('ClaudeCodeWorker — env injection (CI)', () => {
     assert.equal(plan.args[fmtIdx + 1], 'json')
   })
 
-  it('spawn plan injects ANTHROPIC_API_KEY and scrubs CLAUDE_CODE_OAUTH_TOKEN', () => {
+  it('spawn plan injects ANTHROPIC_API_KEY into env', () => {
     const plan = buildSpawnPlan(makeSpec(), 'sk-ant-fake-test-key')
     const env = plan.options.env as Record<string, string>
     assert.equal(env.ANTHROPIC_API_KEY, 'sk-ant-fake-test-key')
-    assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, '')
   })
 
   it('spawn plan does NOT write any credential file path into args', () => {
@@ -73,12 +73,97 @@ describe('ClaudeCodeWorker — env injection (CI)', () => {
     assert.doesNotMatch(joined, /\.claude\//)
   })
 
-  it('spawn plan scrubs all shadow-auth and provider-routing env vars', () => {
-    const plan = buildSpawnPlan(makeSpec(), 'sk-ant-fake-test-key')
-    const env = plan.options.env as Record<string, string>
-    assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, '')
-    assert.equal(env.CLAUDE_CODE_USE_BEDROCK, '')
-    assert.equal(env.CLAUDE_CODE_USE_VERTEX, '')
+  it('spawn env contains exactly the allowlist keys plus ANTHROPIC_API_KEY, no others (closes #8)', () => {
+    // Pollute process.env with a known-bad set covering every category from
+    // issue #8: endpoint redirect, provider switch, model override, alt-auth,
+    // OAuth side-channel, 3P provider creds, NODE_OPTIONS, HTTP_PROXY, plus
+    // an arbitrary leak canary. None of these may appear in the spawn env.
+    const polluted = {
+      FAKE_LEAK_VAR: 'leak',
+      ANTHROPIC_BASE_URL: 'https://evil.example/',
+      ANTHROPIC_MODEL: 'claude-haiku-cheap',
+      ANTHROPIC_AUTH_TOKEN: 'bearer-attacker',
+      ANTHROPIC_CUSTOM_HEADERS: 'X-Evil: 1',
+      CLAUDE_CODE_USE_FOUNDRY: '1',
+      CLAUDE_CODE_USE_ANTHROPIC_AWS: '1',
+      CLAUDE_CODE_API_BASE_URL: 'https://evil.example/v1',
+      CLAUDE_CODE_OAUTH_TOKEN: 'old-style-oauth',
+      CLAUDE_CODE_OAUTH_REFRESH_TOKEN: 'refresh',
+      CLAUDE_CODE_SESSION_ACCESS_TOKEN: 'session',
+      AWS_BEARER_TOKEN_BEDROCK: 'aws-bearer',
+      NODE_OPTIONS: '--inspect=0.0.0.0:9229',
+      HTTP_PROXY: 'http://attacker.example:8080',
+      HTTPS_PROXY: 'http://attacker.example:8080',
+      NO_PROXY: 'localhost',
+    }
+    const saved: Record<string, string | undefined> = {}
+    for (const k of Object.keys(polluted)) {
+      saved[k] = process.env[k]
+      process.env[k] = polluted[k as keyof typeof polluted]
+    }
+    try {
+      const env = buildSpawnEnv('sk-ant-fake-test-key')
+      for (const k of Object.keys(polluted)) {
+        assert.equal(
+          env[k],
+          undefined,
+          `${k} leaked into spawn env — allowlist breach`,
+        )
+      }
+      assert.equal(env.ANTHROPIC_API_KEY, 'sk-ant-fake-test-key')
+      const allowed = new Set([
+        'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL',
+        'LANG', 'LC_ALL', 'TMPDIR', 'TZ',
+        'ANTHROPIC_API_KEY',
+      ])
+      for (const k of Object.keys(env)) {
+        assert.ok(
+          allowed.has(k),
+          `unexpected key in spawn env: ${k} (not in allowlist)`,
+        )
+      }
+    } finally {
+      for (const k of Object.keys(polluted)) {
+        if (saved[k] === undefined) delete process.env[k]
+        else process.env[k] = saved[k]
+      }
+    }
+  })
+
+  it('spawn env passes through allowlist keys when defined in process.env', () => {
+    const saved = {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      USER: process.env.USER,
+    }
+    process.env.PATH = '/usr/bin:/bin'
+    process.env.HOME = '/tmp/fakehome'
+    process.env.USER = 'fakeuser'
+    try {
+      const env = buildSpawnEnv('sk-ant-fake-test-key')
+      assert.equal(env.PATH, '/usr/bin:/bin')
+      assert.equal(env.HOME, '/tmp/fakehome')
+      assert.equal(env.USER, 'fakeuser')
+    } finally {
+      for (const k of Object.keys(saved) as Array<keyof typeof saved>) {
+        if (saved[k] === undefined) delete process.env[k]
+        else process.env[k] = saved[k]
+      }
+    }
+  })
+
+  it('spawn env omits allowlist keys that are absent from process.env (no empty-string padding)', () => {
+    const saved = process.env.TZ
+    delete process.env.TZ
+    try {
+      const env = buildSpawnEnv('sk-ant-fake-test-key')
+      assert.ok(
+        !('TZ' in env),
+        'TZ must be omitted entirely, not set to "" — empty string changes child behavior',
+      )
+    } finally {
+      if (saved !== undefined) process.env.TZ = saved
+    }
   })
 
   it('spawn plan does NOT detach the child (orphan-prevention)', () => {

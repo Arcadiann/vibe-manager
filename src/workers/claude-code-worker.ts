@@ -35,6 +35,69 @@ export function resolveApiKey(
   return fallback
 }
 
+// Explicit allowlist of env vars the worker subprocess is permitted to inherit
+// from the daemon's process.env. Everything else — including the entire
+// CLAUDE_CODE_* and ANTHROPIC_* namespaces — is dropped on the floor.
+//
+// Per-entry justification:
+//   PATH    — needed to locate `claude` and any tools the agent invokes.
+//   HOME    — `claude --bare` still reads $HOME/.claude/settings.json for
+//             non-auth settings; missing $HOME breaks resolution.
+//   USER, LOGNAME — git commit authorship and various tools' shell prompts.
+//   SHELL   — Bash tool inside Claude Code resolves the shell to invoke from
+//             this; absence forces /bin/sh which surprises users.
+//   LANG, LC_ALL — locale; absence yields garbled UTF-8 in tool output.
+//   TMPDIR  — child writes scratch files (worktree state, scrubbed prompts).
+//   TZ      — timestamps in log/event payloads.
+//
+// Explicitly NOT in the allowlist, and why:
+//   - All CLAUDE_CODE_* and ANTHROPIC_*: the worker injects the one credential
+//     it needs (ANTHROPIC_API_KEY below). Inheriting any of these would
+//     reopen issue #8 — endpoint redirection (ANTHROPIC_BASE_URL,
+//     CLAUDE_CODE_API_BASE_URL), provider switching (CLAUDE_CODE_USE_FOUNDRY,
+//     USE_ANTHROPIC_AWS, USE_MANTLE, USE_CCR_V2), alt auth tokens
+//     (ANTHROPIC_AUTH_TOKEN, OAUTH_REFRESH_TOKEN, SESSION_ACCESS_TOKEN,
+//     CUSTOM_OAUTH_URL, *_FILE_DESCRIPTOR), org/scope retargeting
+//     (ANTHROPIC_ORGANIZATION_ID, PROFILE, SCOPE, SERVICE_ACCOUNT_ID,
+//     FEDERATION_RULE_ID, CONFIG_DIR), header injection
+//     (ANTHROPIC_CUSTOM_HEADERS), model/billing override (ANTHROPIC_MODEL
+//     and the DEFAULT_*_MODEL family, SMALL_FAST_MODEL, CUSTOM_MODEL_OPTION,
+//     BETAS, CLAUDE_CODE_SUBSCRIPTION_TYPE, MAX_OUTPUT_TOKENS,
+//     MAX_CONTEXT_TOKENS).
+//   - 3P provider credentials (AWS_BEARER_TOKEN_BEDROCK, AWS_* generally,
+//     GOOGLE_APPLICATION_CREDENTIALS, ANTHROPIC_FOUNDRY_API_KEY, etc.):
+//     same risk — would let the spawned `claude` route spend through a
+//     non-Anthropic backend with non-Anthropic creds, bypassing both the
+//     injected key and the per-key spend cap from ADR-0002.
+//   - NODE_OPTIONS, NODE_PATH: can inject `--inspect` debugger ports or
+//     `--require` preload scripts into the child node runtime that backs
+//     `claude`; arbitrary code execution surface.
+//   - HTTP_PROXY, HTTPS_PROXY, NO_PROXY: standard tooling honors these and
+//     would route Anthropic API traffic through an attacker-controlled proxy,
+//     exfiltrating the injected key on the first request. Revisit if the
+//     dogfood phase ever needs to run behind a corporate proxy — at that
+//     point introduce an explicit per-worker proxy config rather than
+//     environment inheritance.
+const WORKER_ENV_ALLOWLIST = [
+  'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL',
+  'LANG', 'LC_ALL', 'TMPDIR', 'TZ',
+] as const
+
+// Build the env for the worker subprocess from scratch (NOT from process.env).
+// Copies only the keys in WORKER_ENV_ALLOWLIST that are actually defined on
+// the parent, then sets the injected API key. Absent allowlist keys are
+// omitted (not padded with empty strings) so the child sees the same shape
+// it would if the daemon's environment didn't define them.
+export function buildSpawnEnv(apiKey: string): Record<string, string> {
+  const env: Record<string, string> = {}
+  for (const key of WORKER_ENV_ALLOWLIST) {
+    const value = process.env[key]
+    if (value !== undefined) env[key] = value
+  }
+  env.ANTHROPIC_API_KEY = apiKey
+  return env
+}
+
 // Pure builder for the subprocess invocation. Exported so the regression test
 // can assert on args (specifically --bare presence) without spawning anything.
 export function buildSpawnPlan(spec: TaskSpec, apiKey: string): SpawnPlan {
@@ -44,16 +107,7 @@ export function buildSpawnPlan(spec: TaskSpec, apiKey: string): SpawnPlan {
   // key with no supervisor to stop them.
   const options: SpawnOptions = {
     cwd: spec.workingDirectory ?? undefined,
-    env: {
-      ...process.env,
-      ANTHROPIC_API_KEY: apiKey,
-      // Defense in depth: scrub shadow auth and provider-routing env that
-      // could otherwise redirect or override the injected key via Claude Code
-      // code paths --bare does not cover.
-      CLAUDE_CODE_OAUTH_TOKEN: '',
-      CLAUDE_CODE_USE_BEDROCK: '',
-      CLAUDE_CODE_USE_VERTEX: '',
-    },
+    env: buildSpawnEnv(apiKey),
     stdio: ['ignore', 'pipe', 'pipe'],
   }
   return { command: 'claude', args, options }
