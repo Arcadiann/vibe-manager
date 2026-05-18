@@ -6,6 +6,7 @@ import type { ChildProcess } from 'node:child_process'
 
 import {
   ClaudeCodeWorker,
+  HEARTBEAT_INTERVAL_MS,
   MISSING_API_KEY_MESSAGE,
   STOP_GRACE_MS,
   buildSpawnEnv,
@@ -667,6 +668,416 @@ describe('ClaudeCodeWorker — tokens event from usage block (CI, closes #13)', 
     )
     const terminal = events[events.length - 1]
     assert.equal(terminal.kind, 'failed')
+  })
+})
+
+describe('ClaudeCodeWorker — heartbeats (CI, closes #11)', () => {
+  // Long-lived fake child for the multi-heartbeat tests: stdout/stderr stay
+  // open (push() never called with null) and no 'close' is ever emitted, so
+  // session.resolved never settles on its own. Cleanup is the test's
+  // responsibility — call iterator.return() or fire 'close' manually.
+  function neverCloseChild(opts: { pid?: number | null } = {}): ChildProcess {
+    const c = new EventEmitter() as ChildProcess
+    ;(c as { pid?: number }).pid = 'pid' in opts ? (opts.pid ?? undefined) : 12345
+    c.stdout = new Readable({ read() {} }) as ChildProcess['stdout']
+    c.stderr = new Readable({ read() {} }) as ChildProcess['stderr']
+    c.exitCode = null
+    c.signalCode = null
+    c.killed = false
+    return c
+  }
+
+  // Controllable variant for the stop()-mid-stream test: records signals,
+  // honors SIGKILL, and can be driven to exit manually via fireExit().
+  type Controllable = ChildProcess & {
+    signals: NodeJS.Signals[]
+    fireExit: (code: number, signal?: NodeJS.Signals | null) => void
+  }
+  function controllableChild(opts: { onSigterm?: 'exit' | 'ignore' } = {}): Controllable {
+    const onSigterm = opts.onSigterm ?? 'ignore'
+    const c = neverCloseChild() as Controllable
+    c.signals = []
+    c.kill = ((signal?: NodeJS.Signals | number) => {
+      const sig = (typeof signal === 'string' ? signal : 'SIGTERM') as NodeJS.Signals
+      c.signals.push(sig)
+      if (sig === 'SIGTERM' && onSigterm === 'exit') {
+        queueMicrotask(() => c.fireExit(143, 'SIGTERM'))
+      } else if (sig === 'SIGKILL') {
+        queueMicrotask(() => c.fireExit(137, 'SIGKILL'))
+      }
+      return true
+    }) as ChildProcess['kill']
+    c.fireExit = (code, signal) => {
+      c.exitCode = code
+      if (signal != null) c.signalCode = signal
+      c.killed = true
+      ;(c.stdout as Readable).push(null)
+      ;(c.stderr as Readable).push(null)
+      c.emit('exit', code, signal ?? null)
+      queueMicrotask(() => c.emit('close', code, signal ?? null))
+    }
+    return c
+  }
+
+  const ctx: WorkerContext = { env: { ANTHROPIC_API_KEY: 'sk-ant-fake-test-key' } }
+  let SAVED_KEY: string | undefined
+  beforeEach(() => {
+    SAVED_KEY = process.env.ANTHROPIC_API_KEY
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-fake-test-key'
+  })
+  afterEach(() => {
+    if (SAVED_KEY !== undefined) process.env.ANTHROPIC_API_KEY = SAVED_KEY
+    else delete process.env.ANTHROPIC_API_KEY
+  })
+
+  it('long-running subprocess yields ≥2 heartbeats within HEARTBEAT_INTERVAL_MS * 2.5, strictly increasing at, lastEventAt updates', async () => {
+    // mock.timers covers BOTH setTimeout (heartbeat tick) AND Date so the at
+    // values reflect virtual time — otherwise two heartbeats fired in the same
+    // wall-clock millisecond would share an at value and the "strictly
+    // increasing" assertion would be untestable.
+    mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+    try {
+      const child = neverCloseChild()
+      const worker = new ClaudeCodeWorker({ spawnImpl: () => child })
+      const handle = await worker.start(makeSpec(), ctx)
+      const iter = worker.stream(handle)[Symbol.asyncIterator]()
+
+      // First heartbeat: arm fires at HEARTBEAT_INTERVAL_MS.
+      const p1 = iter.next()
+      mock.timers.tick(HEARTBEAT_INTERVAL_MS)
+      const r1 = await p1
+      assert.equal(r1.done, false)
+      assert.equal(r1.value!.kind, 'heartbeat')
+      const hb1 = r1.value as Extract<WorkerEvent, { kind: 'heartbeat' }>
+      const s1 = await worker.status(handle)
+      assert.equal(s1.lastEventAt, hb1.at, 'lastEventAt must update on heartbeat')
+
+      // Second heartbeat: debounced — fires another HEARTBEAT_INTERVAL_MS after
+      // the first. Total virtual elapsed = 2 * HEARTBEAT_INTERVAL_MS, well
+      // within the 2.5x window the spec requires.
+      const p2 = iter.next()
+      mock.timers.tick(HEARTBEAT_INTERVAL_MS)
+      const r2 = await p2
+      assert.equal(r2.value!.kind, 'heartbeat')
+      const hb2 = r2.value as Extract<WorkerEvent, { kind: 'heartbeat' }>
+      assert.ok(hb2.at > hb1.at, `heartbeat at must strictly increase: ${hb1.at} → ${hb2.at}`)
+      const s2 = await worker.status(handle)
+      assert.equal(s2.lastEventAt, hb2.at)
+
+      await iter.return!()
+    } finally {
+      mock.timers.reset()
+    }
+  })
+
+  it('subprocess emits terminal events within one HEARTBEAT_INTERVAL_MS → zero heartbeats emitted', async () => {
+    // The natural event(s) reset the heartbeat timer on every yield, so a
+    // stream that terminates quickly never emits a synthetic heartbeat. No
+    // mock.timers needed — real wall time is microseconds, far under the 25s
+    // tick interval.
+    const envelope = {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: 'OK',
+      usage: { input_tokens: 5, output_tokens: 7 },
+    }
+    const worker = new ClaudeCodeWorker({
+      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
+    })
+    const handle = await worker.start(makeSpec(), ctx)
+    const events: WorkerEvent[] = []
+    for await (const ev of worker.stream(handle)) {
+      events.push(ev)
+      if (ev.kind === 'complete' || ev.kind === 'failed') break
+    }
+    assert.equal(
+      events.filter((e) => e.kind === 'heartbeat').length,
+      0,
+      'heartbeats must NOT fire when natural events are keeping the stream fresh',
+    )
+    // Sanity: tokens + complete still landed.
+    assert.ok(events.find((e) => e.kind === 'tokens'))
+    assert.equal(events[events.length - 1].kind, 'complete')
+  })
+
+  it('debounce: natural event resets the heartbeat timer; original would-have-fired tick does NOT emit', async () => {
+    // Pins the reset-on-every-yield invariant inside enqueue(): advance to
+    // 1ms before the initial heartbeat would fire (no heartbeat yet), then
+    // route natural events through enqueue() via a child close (tokens +
+    // complete), then advance past the original deadline. The original
+    // timer was cleared by the first enqueue, so no heartbeat must land.
+    mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+    try {
+      const child = controllableChild({ onSigterm: 'ignore' })
+      const worker = new ClaudeCodeWorker({ spawnImpl: () => child })
+      const handle = await worker.start(makeSpec(), ctx)
+
+      const events: WorkerEvent[] = []
+      const drain = (async () => {
+        for await (const ev of worker.stream(handle)) {
+          events.push(ev)
+          if (ev.kind === 'complete' || ev.kind === 'failed') break
+        }
+      })()
+      // Let stream() arm its initial heartbeat timer and enter the wait loop.
+      await new Promise<void>((r) => setImmediate(r))
+
+      // Advance to 1ms before HEARTBEAT_INTERVAL_MS — original timer is armed
+      // but has not fired. Heartbeats must still be zero.
+      mock.timers.tick(HEARTBEAT_INTERVAL_MS - 1)
+      await new Promise<void>((r) => setImmediate(r))
+      assert.equal(
+        events.filter((e) => e.kind === 'heartbeat').length,
+        0,
+        'no heartbeat may fire 1ms before HEARTBEAT_INTERVAL_MS',
+      )
+
+      // Yield natural events via close. driveCompletion enqueues tokens then
+      // complete; each enqueue() clears the pending heartbeat timer.
+      const envelope = {
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        result: 'OK',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }
+      ;(child.stdout as Readable).push(JSON.stringify(envelope))
+      await new Promise<void>((r) => setImmediate(r))
+      child.fireExit(0, null)
+      await new Promise<void>((r) => setImmediate(r))
+      await new Promise<void>((r) => setImmediate(r))
+
+      // Advance past the original-would-have-fired deadline (and past where
+      // any newly-armed post-enqueue timer would fire). A leaked original
+      // timer would emit a heartbeat now — assert it does not.
+      mock.timers.tick(HEARTBEAT_INTERVAL_MS * 2)
+      await drain
+
+      assert.equal(
+        events.filter((e) => e.kind === 'heartbeat').length,
+        0,
+        'natural events must reset the heartbeat timer; the original deadline must NOT emit',
+      )
+      assert.equal(events[events.length - 1].kind, 'complete')
+    } finally {
+      mock.timers.reset()
+    }
+  })
+
+  it('stop() mid-stream → no heartbeats emitted between SIGTERM and exit', async () => {
+    mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+    try {
+      const child = controllableChild({ onSigterm: 'ignore' })
+      const worker = new ClaudeCodeWorker({ spawnImpl: () => child })
+      const handle = await worker.start(makeSpec(), ctx)
+
+      const events: WorkerEvent[] = []
+      const drain = (async () => {
+        for await (const ev of worker.stream(handle)) {
+          events.push(ev)
+          if (ev.kind === 'complete' || ev.kind === 'failed') break
+        }
+      })()
+
+      // Let the stream() generator arm its initial heartbeat timer and enter
+      // the wait-for-event state.
+      await new Promise<void>((r) => setImmediate(r))
+
+      // Drive stop(): SIGTERM, state → 'cancelled', grace timer armed for 10s,
+      // SIGKILL after STOP_GRACE_MS, child fires exit/close, driveCompletion
+      // enqueues failed terminal. Advance well past both the grace window AND
+      // multiple HEARTBEAT_INTERVAL_MS so any leaked heartbeat tick would fire.
+      const stopPromise = worker.stop(handle, 'mid-stream cancel')
+      await new Promise<void>((r) => setImmediate(r))
+      mock.timers.tick(HEARTBEAT_INTERVAL_MS * 3)
+      await stopPromise
+      await drain
+
+      assert.equal(
+        events.filter((e) => e.kind === 'heartbeat').length,
+        0,
+        'no heartbeats may be emitted between SIGTERM and exit — state was cancelled, tick must skip',
+      )
+      const terminal = events[events.length - 1]
+      assert.equal(terminal.kind, 'failed')
+      assert.equal(
+        (terminal as Extract<WorkerEvent, { kind: 'failed' }>).terminationMode,
+        'sigkill',
+        'SIGTERM was ignored → SIGKILL escalation expected',
+      )
+    } finally {
+      mock.timers.reset()
+    }
+  })
+
+  it('spawn error before child PID known → heartbeat timer cleared, no leak', async () => {
+    mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+    try {
+      const child = neverCloseChild({ pid: null })
+      const worker = new ClaudeCodeWorker({ spawnImpl: () => child })
+      const handle = await worker.start(makeSpec(), ctx)
+      // Simulate spawn failure landing right after start() returns.
+      queueMicrotask(() => child.emit('error', new Error('spawn ENOENT')))
+
+      const events: WorkerEvent[] = []
+      for await (const ev of worker.stream(handle)) {
+        events.push(ev)
+        if (ev.kind === 'complete' || ev.kind === 'failed') break
+      }
+      // Generator has returned; its finally cleared the timer. Advance virtual
+      // time well past HEARTBEAT_INTERVAL_MS — if the timer were leaking, it
+      // would tick now (and we'd see a heartbeat appended... except the
+      // generator is closed, so the symptom would be a stray scheduled
+      // callback). Cleanest assertion: events array unchanged after tick.
+      const sizeBeforeTick = events.length
+      mock.timers.tick(HEARTBEAT_INTERVAL_MS * 3)
+      assert.equal(events.length, sizeBeforeTick, 'no late heartbeats after generator return')
+      assert.equal(events.length, 1)
+      assert.equal(events[0].kind, 'failed')
+      assert.equal(
+        events.filter((e) => e.kind === 'heartbeat').length,
+        0,
+        'no heartbeat must fire when spawn errors before stream() starts iterating in earnest',
+      )
+    } finally {
+      mock.timers.reset()
+    }
+  })
+})
+
+describe('ClaudeCodeWorker — lastEventAt updates at every WorkerEvent yield site (CI, closes #12)', () => {
+  const ctx: WorkerContext = { env: { ANTHROPIC_API_KEY: 'sk-ant-fake-test-key' } }
+  let SAVED_KEY: string | undefined
+  beforeEach(() => {
+    SAVED_KEY = process.env.ANTHROPIC_API_KEY
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-fake-test-key'
+  })
+  afterEach(() => {
+    if (SAVED_KEY !== undefined) process.env.ANTHROPIC_API_KEY = SAVED_KEY
+    else delete process.env.ANTHROPIC_API_KEY
+  })
+
+  // One it() per yield site so a regression points at the broken path. Each
+  // case drives the stream, then after every yielded event asserts that
+  // status().lastEventAt matches the event's at — proving lastEventAt was
+  // refreshed before the consumer observed the event.
+  const cases: Array<{
+    name: string
+    stdout: string
+    stderr?: string
+    exitCode: number
+    expectedKinds: WorkerEvent['kind'][]
+  }> = [
+    {
+      name: 'success path: tokens + complete',
+      stdout: JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        result: 'OK',
+        usage: { input_tokens: 1, output_tokens: 2 },
+      }),
+      exitCode: 0,
+      expectedKinds: ['tokens', 'complete'],
+    },
+    {
+      name: 'malformed usage: log (warn) + complete',
+      stdout: JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        result: 'OK',
+        usage: 'not an object',
+      }),
+      exitCode: 0,
+      expectedKinds: ['log', 'complete'],
+    },
+    {
+      name: 'failed: envelope is_error true',
+      stdout: JSON.stringify({
+        type: 'result',
+        subtype: 'error_max_turns',
+        is_error: true,
+        result: 'boom',
+      }),
+      exitCode: 0,
+      expectedKinds: ['failed'],
+    },
+    {
+      name: 'failed: envelope missing boolean is_error',
+      stdout: JSON.stringify({ unexpected: 'shape' }),
+      exitCode: 0,
+      expectedKinds: ['failed'],
+    },
+    {
+      name: 'failed: unparseable stdout',
+      stdout: 'not json {{{',
+      exitCode: 0,
+      expectedKinds: ['failed'],
+    },
+    {
+      name: 'failed: non-zero exit',
+      stdout: '',
+      stderr: 'boom',
+      exitCode: 2,
+      expectedKinds: ['failed'],
+    },
+  ]
+
+  for (const c of cases) {
+    it(`updates lastEventAt before yielding — ${c.name}`, async () => {
+      const worker = new ClaudeCodeWorker({
+        spawnImpl: fakeSpawn({ stdout: c.stdout, stderr: c.stderr ?? '', exitCode: c.exitCode }),
+      })
+      const handle = await worker.start(makeSpec(), ctx)
+      const observed: WorkerEvent['kind'][] = []
+      for await (const ev of worker.stream(handle)) {
+        const status = await worker.status(handle)
+        assert.equal(
+          status.lastEventAt,
+          ev.at,
+          `lastEventAt must equal the just-yielded event's at (kind=${ev.kind}, scenario=${c.name})`,
+        )
+        observed.push(ev.kind)
+        if (ev.kind === 'complete' || ev.kind === 'failed') break
+      }
+      assert.deepEqual(observed, c.expectedKinds, `expected event sequence for ${c.name}`)
+    })
+  }
+
+  it('updates lastEventAt before yielding — heartbeat', async () => {
+    // Heartbeat doesn't fit the fakeSpawn pattern above (closes immediately,
+    // never quiet long enough for the heartbeat timer to fire). Use a child
+    // that never closes plus mock.timers to fire one heartbeat, then assert
+    // session.lastEventAt matches the heartbeat's at.
+    mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+    try {
+      const child = new EventEmitter() as ChildProcess
+      ;(child as { pid?: number }).pid = 12345
+      child.stdout = new Readable({ read() {} }) as ChildProcess['stdout']
+      child.stderr = new Readable({ read() {} }) as ChildProcess['stderr']
+      const worker = new ClaudeCodeWorker({ spawnImpl: () => child })
+      const handle = await worker.start(makeSpec(), ctx)
+      const iter = worker.stream(handle)[Symbol.asyncIterator]()
+
+      const p = iter.next()
+      mock.timers.tick(HEARTBEAT_INTERVAL_MS)
+      const r = await p
+      assert.equal(r.done, false)
+      assert.equal(r.value!.kind, 'heartbeat')
+      const hb = r.value as Extract<WorkerEvent, { kind: 'heartbeat' }>
+      const status = await worker.status(handle)
+      assert.equal(
+        status.lastEventAt,
+        hb.at,
+        'lastEventAt must equal the heartbeat event.at after yield',
+      )
+
+      await iter.return!()
+    } finally {
+      mock.timers.reset()
+    }
   })
 })
 
