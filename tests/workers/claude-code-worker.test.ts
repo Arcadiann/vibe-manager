@@ -1,5 +1,8 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
+import { Readable } from 'node:stream'
+import type { ChildProcess } from 'node:child_process'
 
 import {
   ClaudeCodeWorker,
@@ -7,8 +10,37 @@ import {
   buildSpawnEnv,
   buildSpawnPlan,
   resolveApiKey,
+  type SpawnFn,
 } from '../../src/workers/claude-code-worker.ts'
-import type { TaskSpec, WorkerContext } from '../../src/workers/types.ts'
+import type { TaskSpec, WorkerContext, WorkerEvent } from '../../src/workers/types.ts'
+
+// Build a minimal fake ChildProcess: stdout/stderr as Readables that emit the
+// provided strings then end; 'close' fires on the next tick with exitCode.
+function fakeChild(opts: { stdout?: string; stderr?: string; exitCode: number }): ChildProcess {
+  const emitter = new EventEmitter() as ChildProcess
+  ;(emitter as { pid?: number }).pid = 12345
+  emitter.stdout = Readable.from([opts.stdout ?? '']) as ChildProcess['stdout']
+  emitter.stderr = Readable.from([opts.stderr ?? '']) as ChildProcess['stderr']
+  // Defer close until both streams have finished pumping into the worker's
+  // 'data' handlers, otherwise the close fires before stdout is read.
+  setImmediate(() => {
+    setImmediate(() => {
+      emitter.emit('close', opts.exitCode)
+    })
+  })
+  return emitter
+}
+
+function fakeSpawn(opts: { stdout?: string; stderr?: string; exitCode: number }): SpawnFn {
+  return () => fakeChild(opts)
+}
+
+async function drainTerminal(worker: ClaudeCodeWorker, handle: string): Promise<WorkerEvent> {
+  for await (const ev of worker.stream(handle)) {
+    if (ev.kind === 'complete' || ev.kind === 'failed') return ev
+  }
+  throw new Error('stream ended without terminal event')
+}
 
 function makeSpec(overrides: Partial<TaskSpec> = {}): TaskSpec {
   return {
@@ -189,6 +221,102 @@ describe('ClaudeCodeWorker — env injection (CI)', () => {
     )
     assert.equal(resolveApiKey(null, 'sk-ant-fallback'), 'sk-ant-fallback')
     assert.equal(resolveApiKey(undefined, 'sk-ant-fallback'), 'sk-ant-fallback')
+  })
+})
+
+describe('ClaudeCodeWorker — terminal-event mapping (CI, closes #17)', () => {
+  // The seam is constructor-injected spawnImpl; every test here builds a fake
+  // child that emits the stdout/exit-code shape under test, then drains the
+  // stream for the terminal event.
+  const ctx: WorkerContext = { env: { ANTHROPIC_API_KEY: 'sk-ant-fake-test-key' } }
+  const SAVED_KEY = process.env.ANTHROPIC_API_KEY
+  process.env.ANTHROPIC_API_KEY = 'sk-ant-fake-test-key'
+
+  it('exit 0 + parses + is_error: false → complete with result payload', async () => {
+    const envelope = { type: 'result', subtype: 'success', is_error: false, result: 'OK' }
+    const worker = new ClaudeCodeWorker({
+      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
+    })
+    const handle = await worker.start(makeSpec(), ctx)
+    const ev = await drainTerminal(worker, handle)
+    assert.equal(ev.kind, 'complete')
+    assert.equal((ev as Extract<WorkerEvent, { kind: 'complete' }>).partial, false)
+    assert.deepEqual((ev as Extract<WorkerEvent, { kind: 'complete' }>).result, envelope)
+  })
+
+  it('exit 0 + parses + is_error: true + error text → failed with reason from result', async () => {
+    const envelope = {
+      type: 'result',
+      subtype: 'error_max_turns',
+      is_error: true,
+      result: 'Rate limit exceeded: please retry after 60s',
+    }
+    const worker = new ClaudeCodeWorker({
+      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
+    })
+    const handle = await worker.start(makeSpec(), ctx)
+    const ev = await drainTerminal(worker, handle)
+    assert.equal(ev.kind, 'failed')
+    const failed = ev as Extract<WorkerEvent, { kind: 'failed' }>
+    assert.equal(failed.reason, 'Rate limit exceeded: please retry after 60s')
+    assert.equal(failed.recoverable, false)
+    assert.deepEqual(failed.payload, envelope)
+  })
+
+  it('exit 0 + parses + is_error: true + NO error text → failed with synthetic reason', async () => {
+    const envelope = { type: 'result', subtype: 'error_unknown', is_error: true }
+    const worker = new ClaudeCodeWorker({
+      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
+    })
+    const handle = await worker.start(makeSpec(), ctx)
+    const ev = await drainTerminal(worker, handle)
+    assert.equal(ev.kind, 'failed')
+    const failed = ev as Extract<WorkerEvent, { kind: 'failed' }>
+    assert.equal(failed.reason, 'subprocess reported is_error without error text')
+    assert.equal(failed.recoverable, false)
+    assert.deepEqual(failed.payload, envelope)
+  })
+
+  it('exit 0 + parses but envelope has no boolean is_error → failed with synthetic reason', async () => {
+    const malformed = { unexpected: 'shape', no_is_error_field: true }
+    const worker = new ClaudeCodeWorker({
+      spawnImpl: fakeSpawn({ stdout: JSON.stringify(malformed), exitCode: 0 }),
+    })
+    const handle = await worker.start(makeSpec(), ctx)
+    const ev = await drainTerminal(worker, handle)
+    assert.equal(ev.kind, 'failed')
+    const failed = ev as Extract<WorkerEvent, { kind: 'failed' }>
+    assert.match(failed.reason, /missing boolean is_error/)
+    assert.deepEqual(failed.payload, malformed)
+  })
+
+  it('exit 0 + unparseable stdout → failed with parse-error reason', async () => {
+    const worker = new ClaudeCodeWorker({
+      spawnImpl: fakeSpawn({ stdout: 'not json at all {{{', exitCode: 0 }),
+    })
+    const handle = await worker.start(makeSpec(), ctx)
+    const ev = await drainTerminal(worker, handle)
+    assert.equal(ev.kind, 'failed')
+    const failed = ev as Extract<WorkerEvent, { kind: 'failed' }>
+    assert.match(failed.reason, /unparseable subprocess stdout/)
+  })
+
+  it('exit non-zero → failed (regression guard for existing behavior)', async () => {
+    const worker = new ClaudeCodeWorker({
+      spawnImpl: fakeSpawn({ stdout: '', stderr: 'boom', exitCode: 2 }),
+    })
+    const handle = await worker.start(makeSpec(), ctx)
+    const ev = await drainTerminal(worker, handle)
+    assert.equal(ev.kind, 'failed')
+    const failed = ev as Extract<WorkerEvent, { kind: 'failed' }>
+    assert.equal(failed.reason, 'boom')
+    assert.equal(failed.recoverable, false)
+  })
+
+  // Restore env state after the describe block runs.
+  it('(env cleanup)', () => {
+    if (SAVED_KEY !== undefined) process.env.ANTHROPIC_API_KEY = SAVED_KEY
+    else delete process.env.ANTHROPIC_API_KEY
   })
 })
 

@@ -1,6 +1,22 @@
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 
+// Constructor-injected spawn for the parse-path tests in issue #17 and beyond.
+// Picked function-pointer-via-constructor over a module-level mutable export
+// because (a) it keeps test state local to the worker instance under test —
+// no shared mutable module state to reset between tests — and (b) the
+// WorkerAgent interface is unaffected: the constructor is implementation-
+// private, callers still do `new ClaudeCodeWorker()` with no args.
+export type SpawnFn = (
+  command: string,
+  args: readonly string[],
+  options: SpawnOptions,
+) => ChildProcess
+
+export type ClaudeCodeWorkerOptions = {
+  spawnImpl?: SpawnFn
+}
+
 import type {
   SessionHandle,
   TaskSpec,
@@ -129,14 +145,16 @@ type Session = {
 // future move to --output-format stream-json without re-plumbing.
 export class ClaudeCodeWorker implements WorkerAgent {
   readonly #apiKey: string
+  readonly #spawn: SpawnFn
   readonly #sessions = new Map<SessionHandle, Session>()
 
-  constructor() {
+  constructor(opts: ClaudeCodeWorkerOptions = {}) {
     const key = process.env.ANTHROPIC_API_KEY
     if (key == null || key.length === 0) {
       throw new Error(MISSING_API_KEY_MESSAGE)
     }
     this.#apiKey = key
+    this.#spawn = opts.spawnImpl ?? spawn
   }
 
   capabilities(): WorkerCapabilities {
@@ -156,7 +174,7 @@ export class ClaudeCodeWorker implements WorkerAgent {
   async start(spec: TaskSpec, ctx: WorkerContext): Promise<SessionHandle> {
     const apiKey = resolveApiKey(ctx, this.#apiKey)
     const plan = buildSpawnPlan(spec, apiKey)
-    const child = spawn(plan.command, plan.args, plan.options)
+    const child = this.#spawn(plan.command, plan.args, plan.options)
 
     const handle: SessionHandle = `claude-code:${child.pid ?? 'nopid'}:${randomUUID()}`
 
@@ -227,6 +245,45 @@ export class ClaudeCodeWorker implements WorkerAgent {
           at,
           reason: `unparseable subprocess stdout: ${(err as Error).message}`,
           recoverable: false,
+        }
+        return
+      }
+      // Closes #17: subprocess exit 0 is NOT the same as task success when
+      // claude --output-format json wraps API/tool errors in an envelope with
+      // is_error: true (rate limit, 401, content filter, tool-loop give-up).
+      // The envelope shape is { type, subtype, is_error, result, ... }; the
+      // human-readable error message lives in `result` when is_error is true.
+      // Anything that isn't a plain object with a boolean is_error is treated
+      // as a malformed envelope and alarmed rather than passed through —
+      // silent success-when-actually-failed is the worst possible outcome.
+      const envelope = parsed as { is_error?: unknown; result?: unknown } | null
+      const isError = envelope != null && typeof envelope === 'object'
+        ? envelope.is_error
+        : undefined
+      if (typeof isError !== 'boolean') {
+        yield {
+          kind: 'failed',
+          at,
+          reason: 'subprocess result envelope missing boolean is_error field',
+          recoverable: false,
+          payload: parsed,
+        }
+        return
+      }
+      if (isError) {
+        const errText = typeof envelope!.result === 'string' && envelope!.result.length > 0
+          ? envelope!.result
+          : 'subprocess reported is_error without error text'
+        yield {
+          kind: 'failed',
+          at,
+          reason: errText,
+          // recoverable: false is conservative — escalate by default rather
+          // than retry-loop on a quota/auth/policy error. Per-error-type
+          // classification can be layered in later without breaking this
+          // contract.
+          recoverable: false,
+          payload: parsed,
         }
         return
       }
