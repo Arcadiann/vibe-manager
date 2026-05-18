@@ -50,7 +50,21 @@ export type WorkerEvent =
   | { kind: 'tool_call'; at: number; toolCallId: string; tool: string; argsPreview: string }
   | { kind: 'tool_result'; at: number; toolCallId: string; ok: boolean; resultPreview: string }
   | { kind: 'file_edit'; at: number; path: string; bytesChanged: number }
-  | { kind: 'tokens'; at: number; inputTokens: number; outputTokens: number }
+  | {
+      kind: 'tokens'
+      at: number
+      inputTokens: number
+      outputTokens: number
+      // Cache-token fields are an additive extension over ADR-0001's
+      // `tokens` shape. ADR-0001:101 specifies only input/output; the
+      // Anthropic Messages API Usage object also surfaces cache counts,
+      // which the orchestrator's cost computation may want. Both are
+      // optional — workers that don't surface cache data omit them
+      // entirely rather than padding zeros (a present-and-zero field
+      // would falsely imply "we know there were zero cache hits").
+      cacheCreationInputTokens?: number
+      cacheReadInputTokens?: number
+    }
   | { kind: 'blocked'; at: number; reason: string; needs: string }
   | { kind: 'complete'; at: number; partial: boolean; result: unknown }
   | {
