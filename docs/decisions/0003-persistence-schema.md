@@ -202,10 +202,17 @@ Not goals of this ADR; future decisions required:
 - [ADR-0002](0002-worker-auth-api-key.md) — Worker Authentication via `ANTHROPIC_API_KEY`. Establishes the credential delivery channel; not modified by this ADR.
 - [`docs/planning/schema-proposal.md`](../planning/schema-proposal.md) — prior planning draft; this ADR supersedes it as the architecture-of-record.
 - [`src/workers/types.ts`](../../src/workers/types.ts) — `WorkerEvent` union the `events.payload` column must accommodate.
-- Follow-up issues (all must resolve before Proposed → Accepted):
+- Follow-up issues (all must resolve before Proposed → Accepted). Issues #33–#38 were filed alongside the ADR's initial draft; issues #41–#47 were surfaced during operator review and are additional pre-Accepted gates against the same Status.
   - [#33](https://github.com/Arcadiann/vibe-manager/issues/33) — embedding model selection (formal record).
   - [#34](https://github.com/Arcadiann/vibe-manager/issues/34) — `events` retention default.
   - [#35](https://github.com/Arcadiann/vibe-manager/issues/35) — append-only enforcement on `events`.
   - [#36](https://github.com/Arcadiann/vibe-manager/issues/36) — post-task memory summarizer timing.
   - [#37](https://github.com/Arcadiann/vibe-manager/issues/37) — soft-delete / forget-task path.
   - [#38](https://github.com/Arcadiann/vibe-manager/issues/38) — `tasks.status` ↔ ADR-0001 vocabulary drift detection.
+  - [#41](https://github.com/Arcadiann/vibe-manager/issues/41) — schema fix: `tokens_spent_cents` bigint rounds individual tokens to zero.
+  - [#42](https://github.com/Arcadiann/vibe-manager/issues/42) — task `idempotency_key` for restart-mid-run dedup.
+  - [#43](https://github.com/Arcadiann/vibe-manager/issues/43) — clarification: `status_reason` is current-only; use `events` for transition history.
+  - [#44](https://github.com/Arcadiann/vibe-manager/issues/44) — audit guarantee: `task_spec` vs rendered worker prompt.
+  - [#45](https://github.com/Arcadiann/vibe-manager/issues/45) — docs: `memory.event_id` provenance is soft (events retention nulls it).
+  - [#46](https://github.com/Arcadiann/vibe-manager/issues/46) — forward-flag: `memory.last_used_at` write-amplification at scale.
+  - [#47](https://github.com/Arcadiann/vibe-manager/issues/47) — migration constraint: explicitly disable RLS on `vibe_manager` tables.
