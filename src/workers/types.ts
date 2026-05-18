@@ -62,6 +62,13 @@ export type WorkerEvent =
       // parsed result envelope when the subprocess exited 0 but reported
       // is_error). Orchestrator treats this as diagnostic data only.
       payload?: unknown
+      // Set by workers that terminated the underlying resource themselves
+      // (e.g. ClaudeCodeWorker's stop() escalating SIGTERM → SIGKILL).
+      // 'sigterm' means the child honored the graceful signal; 'sigkill' means
+      // the grace window elapsed and the worker had to force-terminate.
+      // Diagnostic-only for now; orchestrator may use this to inform retry
+      // policy later. Absent on failures unrelated to stop().
+      terminationMode?: 'sigterm' | 'sigkill'
     }
 
 export interface WorkerAgent {
