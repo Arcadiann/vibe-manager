@@ -122,6 +122,57 @@ export function buildSpawnEnv(apiKey: string): Record<string, string> {
   return env
 }
 
+// Result of attempting to extract a `tokens` event from the result envelope's
+// usage block. `missing` and `malformed` are both non-fatal: stream() proceeds
+// to emit `complete` either way. `malformed` triggers a `log` warning event so
+// the operator can see that telemetry was degraded; `missing` is silent because
+// not every worker run will have a usage block (the cheap version only handles
+// successful completion).
+export type UsageExtractResult =
+  | { kind: 'ok'; event: Extract<WorkerEvent, { kind: 'tokens' }> }
+  | { kind: 'missing' }
+  | { kind: 'malformed'; reason: string }
+
+// Parses the Claude Code result envelope's `usage` block into a `tokens`
+// WorkerEvent. Snake-case (`input_tokens`, `cache_read_input_tokens`, ...) is
+// preserved on the *input* side because that's what the upstream Anthropic
+// Messages API / Claude Code CLI emits — anyone grepping for the field name
+// across the boundary should land here. The *output* event uses camelCase per
+// ADR-0001:101 (`inputTokens`, `outputTokens`) and the orchestrator's
+// camelCase convention; cache fields follow the same convention as an additive
+// extension.
+//
+// Cheap-version scope: this only runs on successful envelopes (is_error =
+// false). Failed envelopes that carry partial usage are not billed in this
+// model — fixing that requires --output-format stream-json to track usage as
+// it accumulates, which is deferred to the p3 follow-up.
+export function extractTokensEvent(usage: unknown, at: number): UsageExtractResult {
+  if (usage == null) return { kind: 'missing' }
+  if (typeof usage !== 'object') {
+    return { kind: 'malformed', reason: `usage is not an object (got ${typeof usage})` }
+  }
+  const u = usage as Record<string, unknown>
+  const input = u.input_tokens
+  const output = u.output_tokens
+  if (typeof input !== 'number' || typeof output !== 'number') {
+    return {
+      kind: 'malformed',
+      reason: `input_tokens/output_tokens missing or non-numeric (got ${typeof input}/${typeof output})`,
+    }
+  }
+  const event: Extract<WorkerEvent, { kind: 'tokens' }> = {
+    kind: 'tokens',
+    at,
+    inputTokens: input,
+    outputTokens: output,
+  }
+  const cacheCreate = u.cache_creation_input_tokens
+  if (typeof cacheCreate === 'number') event.cacheCreationInputTokens = cacheCreate
+  const cacheRead = u.cache_read_input_tokens
+  if (typeof cacheRead === 'number') event.cacheReadInputTokens = cacheRead
+  return { kind: 'ok', event }
+}
+
 // Pure builder for the subprocess invocation. Exported so the regression test
 // can assert on args (specifically --bare presence) without spawning anything.
 export function buildSpawnPlan(spec: TaskSpec, apiKey: string): SpawnPlan {
@@ -272,7 +323,7 @@ export class ClaudeCodeWorker implements WorkerAgent {
       // Anything that isn't a plain object with a boolean is_error is treated
       // as a malformed envelope and alarmed rather than passed through —
       // silent success-when-actually-failed is the worst possible outcome.
-      const envelope = parsed as { is_error?: unknown; result?: unknown } | null
+      const envelope = parsed as { is_error?: unknown; result?: unknown; usage?: unknown } | null
       const isError = envelope != null && typeof envelope === 'object'
         ? envelope.is_error
         : undefined
@@ -302,6 +353,29 @@ export class ClaudeCodeWorker implements WorkerAgent {
           payload: parsed,
         }
         return
+      }
+      // Closes #13: emit one `tokens` event from the successful envelope's
+      // usage block before `complete` so the orchestrator has end-of-task
+      // accounting even without stream-json incremental reporting.
+      // ADR-0001:111 calls this the "low-fidelity" path; a future PR (p3
+      // follow-up) will switch to --output-format stream-json for the
+      // high-fidelity path Claude Code was declared to satisfy
+      // (ADR-0001:178).
+      const tokens = extractTokensEvent(envelope!.usage, at)
+      if (tokens.kind === 'ok') {
+        // Partial fix for #12 — lastEventAt should be updated at every
+        // event site, not just terminal ones. Doing it here because this
+        // PR's emit-path naturally requires it; the broader #12 fix
+        // covers the rest.
+        session.lastEventAt = at
+        yield tokens.event
+      } else if (tokens.kind === 'malformed') {
+        yield {
+          kind: 'log',
+          at,
+          level: 'warn',
+          message: `subprocess result envelope usage block malformed: ${tokens.reason}`,
+        }
       }
       yield { kind: 'complete', at, partial: false, result: parsed }
     } else {

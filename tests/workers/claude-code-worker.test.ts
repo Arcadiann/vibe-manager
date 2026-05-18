@@ -496,6 +496,180 @@ describe('ClaudeCodeWorker — stop() lifecycle (CI, closes #14)', () => {
 
 })
 
+describe('ClaudeCodeWorker — tokens event from usage block (CI, closes #13)', () => {
+  // Drain every event from stream() into an array so order assertions ("tokens
+  // before complete") and presence/absence assertions are both easy to write.
+  async function drainAll(worker: ClaudeCodeWorker, handle: string): Promise<WorkerEvent[]> {
+    const out: WorkerEvent[] = []
+    for await (const ev of worker.stream(handle)) {
+      out.push(ev)
+      if (ev.kind === 'complete' || ev.kind === 'failed') break
+    }
+    return out
+  }
+
+  const ctx: WorkerContext = { env: { ANTHROPIC_API_KEY: 'sk-ant-fake-test-key' } }
+  let SAVED_KEY: string | undefined
+  beforeEach(() => {
+    SAVED_KEY = process.env.ANTHROPIC_API_KEY
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-fake-test-key'
+  })
+  afterEach(() => {
+    if (SAVED_KEY !== undefined) process.env.ANTHROPIC_API_KEY = SAVED_KEY
+    else delete process.env.ANTHROPIC_API_KEY
+  })
+
+  it('envelope with usage (no cache fields) → tokens emitted before complete with input/output only', async () => {
+    const envelope = {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: 'OK',
+      usage: { input_tokens: 123, output_tokens: 45 },
+    }
+    const worker = new ClaudeCodeWorker({
+      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
+    })
+    const handle = await worker.start(makeSpec(), ctx)
+    const events = await drainAll(worker, handle)
+    const tokensIdx = events.findIndex((e) => e.kind === 'tokens')
+    const completeIdx = events.findIndex((e) => e.kind === 'complete')
+    assert.notEqual(tokensIdx, -1, 'tokens event must be emitted')
+    assert.notEqual(completeIdx, -1, 'complete event must be emitted')
+    assert.ok(tokensIdx < completeIdx, 'tokens must precede complete')
+    const tokens = events[tokensIdx] as Extract<WorkerEvent, { kind: 'tokens' }>
+    assert.equal(tokens.inputTokens, 123)
+    assert.equal(tokens.outputTokens, 45)
+    assert.ok(
+      !('cacheCreationInputTokens' in tokens),
+      'absent cache fields must be omitted from the event, not set to zero/undefined',
+    )
+    assert.ok(!('cacheReadInputTokens' in tokens))
+  })
+
+  it('envelope with cache-token fields → forwarded onto the tokens event', async () => {
+    const envelope = {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: 'OK',
+      usage: {
+        input_tokens: 10,
+        output_tokens: 20,
+        cache_creation_input_tokens: 500,
+        cache_read_input_tokens: 1500,
+      },
+    }
+    const worker = new ClaudeCodeWorker({
+      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
+    })
+    const handle = await worker.start(makeSpec(), ctx)
+    const events = await drainAll(worker, handle)
+    const tokens = events.find((e) => e.kind === 'tokens') as
+      | Extract<WorkerEvent, { kind: 'tokens' }>
+      | undefined
+    assert.ok(tokens, 'tokens event must be emitted')
+    assert.equal(tokens.inputTokens, 10)
+    assert.equal(tokens.outputTokens, 20)
+    assert.equal(tokens.cacheCreationInputTokens, 500)
+    assert.equal(tokens.cacheReadInputTokens, 1500)
+  })
+
+  it('envelope without usage block → no tokens event, complete still emitted, no error', async () => {
+    const envelope = { type: 'result', subtype: 'success', is_error: false, result: 'OK' }
+    const worker = new ClaudeCodeWorker({
+      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
+    })
+    const handle = await worker.start(makeSpec(), ctx)
+    const events = await drainAll(worker, handle)
+    assert.equal(
+      events.find((e) => e.kind === 'tokens'),
+      undefined,
+      'missing usage block must NOT produce a tokens event',
+    )
+    assert.equal(
+      events.find((e) => e.kind === 'log'),
+      undefined,
+      'missing usage is silent (degraded telemetry), not a warning',
+    )
+    const terminal = events[events.length - 1]
+    assert.equal(terminal.kind, 'complete')
+  })
+
+  it('envelope with usage as a non-object (string) → no tokens, warn log, complete still emitted', async () => {
+    const envelope = {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: 'OK',
+      usage: 'not an object at all',
+    }
+    const worker = new ClaudeCodeWorker({
+      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
+    })
+    const handle = await worker.start(makeSpec(), ctx)
+    const events = await drainAll(worker, handle)
+    assert.equal(events.find((e) => e.kind === 'tokens'), undefined)
+    const log = events.find((e) => e.kind === 'log') as
+      | Extract<WorkerEvent, { kind: 'log' }>
+      | undefined
+    assert.ok(log, 'malformed usage must produce a warn log')
+    assert.equal(log.level, 'warn')
+    assert.match(log.message, /usage block malformed/)
+    const terminal = events[events.length - 1]
+    assert.equal(terminal.kind, 'complete')
+  })
+
+  it('envelope with non-numeric counts → no tokens, warn log, complete still emitted', async () => {
+    const envelope = {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: 'OK',
+      usage: { input_tokens: 'lots', output_tokens: null },
+    }
+    const worker = new ClaudeCodeWorker({
+      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
+    })
+    const handle = await worker.start(makeSpec(), ctx)
+    const events = await drainAll(worker, handle)
+    assert.equal(events.find((e) => e.kind === 'tokens'), undefined)
+    const log = events.find((e) => e.kind === 'log') as
+      | Extract<WorkerEvent, { kind: 'log' }>
+      | undefined
+    assert.ok(log, 'malformed usage must produce a warn log')
+    assert.equal(log.level, 'warn')
+    assert.match(log.message, /input_tokens\/output_tokens missing or non-numeric/)
+    const terminal = events[events.length - 1]
+    assert.equal(terminal.kind, 'complete')
+  })
+
+  it('envelope with is_error: true (even if usage present) → no tokens event on the failed path', async () => {
+    // Cheap version doesn't bill failed paths. The Claude Code envelope may
+    // carry partial usage on failure; capturing that requires per-message
+    // tracking (stream-json), deferred to the p3 follow-up.
+    const envelope = {
+      type: 'result',
+      subtype: 'error_max_turns',
+      is_error: true,
+      result: 'Rate limit exceeded',
+      usage: { input_tokens: 999, output_tokens: 1 },
+    }
+    const worker = new ClaudeCodeWorker({
+      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
+    })
+    const handle = await worker.start(makeSpec(), ctx)
+    const events = await drainAll(worker, handle)
+    assert.equal(
+      events.find((e) => e.kind === 'tokens'),
+      undefined,
+      'failed envelopes must not emit tokens in the cheap version',
+    )
+    const terminal = events[events.length - 1]
+    assert.equal(terminal.kind, 'failed')
+  })
+})
+
 const RUN_INTEGRATION = process.env.RUN_INTEGRATION_TESTS === '1'
 const HAS_KEY = !!process.env.ANTHROPIC_API_KEY
 const INTEGRATION_SKIP_REASON = !RUN_INTEGRATION
