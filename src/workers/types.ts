@@ -53,7 +53,16 @@ export type WorkerEvent =
   | { kind: 'tokens'; at: number; inputTokens: number; outputTokens: number }
   | { kind: 'blocked'; at: number; reason: string; needs: string }
   | { kind: 'complete'; at: number; partial: boolean; result: unknown }
-  | { kind: 'failed'; at: number; reason: string; recoverable: boolean }
+  | {
+      kind: 'failed'
+      at: number
+      reason: string
+      recoverable: boolean
+      // Optional opaque payload the worker captured at failure time (e.g. the
+      // parsed result envelope when the subprocess exited 0 but reported
+      // is_error). Orchestrator treats this as diagnostic data only.
+      payload?: unknown
+    }
 
 export interface WorkerAgent {
   capabilities(): WorkerCapabilities
