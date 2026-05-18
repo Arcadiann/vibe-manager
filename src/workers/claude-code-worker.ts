@@ -35,6 +35,16 @@ import type {
 // orchestrator design surfaces a real per-task tuning requirement.
 export const STOP_GRACE_MS = 10_000
 
+// Debounced heartbeat tick cadence. Matches the worker-specific cadence in
+// ADR-0001:136 ("Emits a synthetic heartbeat if no upstream event in 25s"),
+// which sits comfortably under the 30s zombie-detection threshold in
+// ADR-0001:107 (Workers MUST emit at least one event per HEARTBEAT_INTERVAL_MS,
+// default 30s) with a 5s safety margin. Debounced rather than periodic: every
+// natural WorkerEvent yield resets the timer, so a healthy stream of tokens /
+// logs / progress suppresses heartbeats entirely — heartbeats only fire when
+// nothing else is happening.
+export const HEARTBEAT_INTERVAL_MS = 25_000
+
 export const MISSING_API_KEY_MESSAGE =
   'ClaudeCodeWorker requires ANTHROPIC_API_KEY in the daemon process environment ' +
   'before instantiation. See ADR-0002: the worker tier is API-key-only and the ' +
@@ -300,93 +310,166 @@ export class ClaudeCodeWorker implements WorkerAgent {
 
   async *stream(handle: SessionHandle): AsyncIterable<WorkerEvent> {
     const session = this.#requireSession(handle)
-    const { exitCode, stdout, stderr } = await session.resolved
-    const at = Date.now()
-    if (exitCode === 0) {
-      let parsed: unknown
-      try {
-        parsed = JSON.parse(stdout)
-      } catch (err) {
-        yield {
+
+    // Closes #11 (heartbeats) and #12 (lastEventAt refreshes at every yield
+    // site). The single emit path here owns both: every WorkerEvent — natural
+    // or synthetic — flows through enqueue(), which (a) refreshes
+    // session.lastEventAt before the event reaches the consumer and (b)
+    // resets the heartbeat timer so heartbeats only fire when nothing else
+    // is happening on the stream (the "only when quiet" semantics ADR-0001:136
+    // requires).
+    const queue: WorkerEvent[] = []
+    let done = false
+    let wake: (() => void) | undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    const wakeNow = () => {
+      if (wake) {
+        const w = wake
+        wake = undefined
+        w()
+      }
+    }
+
+    const scheduleHeartbeat = () => {
+      if (timer !== undefined) clearTimeout(timer)
+      timer = setTimeout(() => {
+        timer = undefined
+        // Guard per §"heartbeat must NOT yield while stop() is in flight":
+        // once state has moved out of running/starting (cancelled by stop(),
+        // or already terminal), a heartbeat would either confuse the
+        // orchestrator's graceful-shutdown interpretation or violate the
+        // exactly-once-terminal contract. Skip without rearming — the
+        // generator's finally still clears any stale timer on exit.
+        if (session.state !== 'running' && session.state !== 'starting') return
+        enqueue({ kind: 'heartbeat', at: Date.now() })
+      }, HEARTBEAT_INTERVAL_MS)
+    }
+
+    const enqueue = (event: WorkerEvent) => {
+      session.lastEventAt = event.at
+      queue.push(event)
+      scheduleHeartbeat()
+      wakeNow()
+    }
+
+    const finish = () => {
+      done = true
+      wakeNow()
+    }
+
+    const driveCompletion = async () => {
+      const { exitCode, stdout, stderr } = await session.resolved
+      const at = Date.now()
+      if (exitCode === 0) {
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(stdout)
+        } catch (err) {
+          enqueue({
+            kind: 'failed',
+            at,
+            reason: `unparseable subprocess stdout: ${(err as Error).message}`,
+            recoverable: false,
+          })
+          finish()
+          return
+        }
+        // Closes #17: subprocess exit 0 is NOT the same as task success when
+        // claude --output-format json wraps API/tool errors in an envelope with
+        // is_error: true (rate limit, 401, content filter, tool-loop give-up).
+        // The envelope shape is { type, subtype, is_error, result, ... }; the
+        // human-readable error message lives in `result` when is_error is true.
+        // Anything that isn't a plain object with a boolean is_error is treated
+        // as a malformed envelope and alarmed rather than passed through —
+        // silent success-when-actually-failed is the worst possible outcome.
+        const envelope = parsed as { is_error?: unknown; result?: unknown; usage?: unknown } | null
+        const isError = envelope != null && typeof envelope === 'object'
+          ? envelope.is_error
+          : undefined
+        if (typeof isError !== 'boolean') {
+          enqueue({
+            kind: 'failed',
+            at,
+            reason: 'subprocess result envelope missing boolean is_error field',
+            recoverable: false,
+            payload: parsed,
+          })
+          finish()
+          return
+        }
+        if (isError) {
+          const errText = typeof envelope!.result === 'string' && envelope!.result.length > 0
+            ? envelope!.result
+            : 'subprocess reported is_error without error text'
+          enqueue({
+            kind: 'failed',
+            at,
+            reason: errText,
+            // recoverable: false is conservative — escalate by default rather
+            // than retry-loop on a quota/auth/policy error. Per-error-type
+            // classification can be layered in later without breaking this
+            // contract.
+            recoverable: false,
+            payload: parsed,
+          })
+          finish()
+          return
+        }
+        // Closes #13: emit one `tokens` event from the successful envelope's
+        // usage block before `complete` so the orchestrator has end-of-task
+        // accounting even without stream-json incremental reporting.
+        // ADR-0001:111 calls this the "low-fidelity" path; a future PR (p3
+        // follow-up) will switch to --output-format stream-json for the
+        // high-fidelity path Claude Code was declared to satisfy
+        // (ADR-0001:178).
+        const tokens = extractTokensEvent(envelope!.usage, at)
+        if (tokens.kind === 'ok') {
+          enqueue(tokens.event)
+        } else if (tokens.kind === 'malformed') {
+          enqueue({
+            kind: 'log',
+            at,
+            level: 'warn',
+            message: `subprocess result envelope usage block malformed: ${tokens.reason}`,
+          })
+        }
+        enqueue({ kind: 'complete', at, partial: false, result: parsed })
+        finish()
+      } else {
+        const failed: Extract<WorkerEvent, { kind: 'failed' }> = {
           kind: 'failed',
           at,
-          reason: `unparseable subprocess stdout: ${(err as Error).message}`,
+          reason: stderr.trim() || `claude subprocess exited with code ${exitCode}`,
           recoverable: false,
         }
-        return
+        if (session.terminationMode) failed.terminationMode = session.terminationMode
+        enqueue(failed)
+        finish()
       }
-      // Closes #17: subprocess exit 0 is NOT the same as task success when
-      // claude --output-format json wraps API/tool errors in an envelope with
-      // is_error: true (rate limit, 401, content filter, tool-loop give-up).
-      // The envelope shape is { type, subtype, is_error, result, ... }; the
-      // human-readable error message lives in `result` when is_error is true.
-      // Anything that isn't a plain object with a boolean is_error is treated
-      // as a malformed envelope and alarmed rather than passed through —
-      // silent success-when-actually-failed is the worst possible outcome.
-      const envelope = parsed as { is_error?: unknown; result?: unknown; usage?: unknown } | null
-      const isError = envelope != null && typeof envelope === 'object'
-        ? envelope.is_error
-        : undefined
-      if (typeof isError !== 'boolean') {
-        yield {
-          kind: 'failed',
-          at,
-          reason: 'subprocess result envelope missing boolean is_error field',
-          recoverable: false,
-          payload: parsed,
+    }
+
+    try {
+      scheduleHeartbeat()
+      // driveCompletion is fire-and-forget: its only side effects are
+      // enqueue()/finish(), both of which the loop below already observes.
+      // Awaiting it here would defeat heartbeat interleaving.
+      void driveCompletion()
+      while (true) {
+        while (queue.length > 0) {
+          yield queue.shift()!
         }
-        return
+        if (done) return
+        await new Promise<void>((resolve) => { wake = resolve })
       }
-      if (isError) {
-        const errText = typeof envelope!.result === 'string' && envelope!.result.length > 0
-          ? envelope!.result
-          : 'subprocess reported is_error without error text'
-        yield {
-          kind: 'failed',
-          at,
-          reason: errText,
-          // recoverable: false is conservative — escalate by default rather
-          // than retry-loop on a quota/auth/policy error. Per-error-type
-          // classification can be layered in later without breaking this
-          // contract.
-          recoverable: false,
-          payload: parsed,
-        }
-        return
+    } finally {
+      // try/finally guarantees the heartbeat timer is cleared on EVERY exit
+      // path — natural completion, consumer break/throw, spawn error, parse
+      // error, stop()-driven termination. No leaked timers in CI or prod.
+      if (timer !== undefined) {
+        clearTimeout(timer)
+        timer = undefined
       }
-      // Closes #13: emit one `tokens` event from the successful envelope's
-      // usage block before `complete` so the orchestrator has end-of-task
-      // accounting even without stream-json incremental reporting.
-      // ADR-0001:111 calls this the "low-fidelity" path; a future PR (p3
-      // follow-up) will switch to --output-format stream-json for the
-      // high-fidelity path Claude Code was declared to satisfy
-      // (ADR-0001:178).
-      const tokens = extractTokensEvent(envelope!.usage, at)
-      if (tokens.kind === 'ok') {
-        // Partial fix for #12 — lastEventAt should be updated at every
-        // event site, not just terminal ones. Doing it here because this
-        // PR's emit-path naturally requires it; the broader #12 fix
-        // covers the rest.
-        session.lastEventAt = at
-        yield tokens.event
-      } else if (tokens.kind === 'malformed') {
-        yield {
-          kind: 'log',
-          at,
-          level: 'warn',
-          message: `subprocess result envelope usage block malformed: ${tokens.reason}`,
-        }
-      }
-      yield { kind: 'complete', at, partial: false, result: parsed }
-    } else {
-      const failed: Extract<WorkerEvent, { kind: 'failed' }> = {
-        kind: 'failed',
-        at,
-        reason: stderr.trim() || `claude subprocess exited with code ${exitCode}`,
-        recoverable: false,
-      }
-      if (session.terminationMode) failed.terminationMode = session.terminationMode
-      yield failed
     }
   }
 
