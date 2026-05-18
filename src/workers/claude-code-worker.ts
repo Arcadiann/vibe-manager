@@ -27,6 +27,14 @@ import type {
   WorkerStatusReport,
 } from './types.ts'
 
+// Grace window between SIGTERM and SIGKILL inside stop(). Matches ADR-0001
+// §"Lifecycle" (10s default): long enough for a well-behaved subprocess to
+// flush stdout, write final tokens, and exit cleanly; short enough that a
+// hung child can't deadlock the orchestrator's stop path or daemon shutdown.
+// Not configurable per call in this PR — single project-wide default until
+// orchestrator design surfaces a real per-task tuning requirement.
+export const STOP_GRACE_MS = 10_000
+
 export const MISSING_API_KEY_MESSAGE =
   'ClaudeCodeWorker requires ANTHROPIC_API_KEY in the daemon process environment ' +
   'before instantiation. See ADR-0002: the worker tier is API-key-only and the ' +
@@ -137,6 +145,14 @@ type Session = {
   reason: string | null
   // Resolves when the subprocess closes. Stream/status read from this.
   resolved: Promise<{ exitCode: number; stdout: string; stderr: string }>
+  // In-flight stop() promise — used to dedupe concurrent stop() calls so a
+  // second caller gets the same promise rather than starting a second
+  // termination sequence.
+  stopPromise?: Promise<void>
+  // Recorded by stop() once the termination outcome is known. Stream() reads
+  // this onto the emitted `failed` event so the orchestrator can tell a
+  // graceful exit from a forced one.
+  terminationMode?: 'sigterm' | 'sigkill'
 }
 
 // child_process.spawn is preferred over execFile here: execFile buffers stdout
@@ -289,32 +305,85 @@ export class ClaudeCodeWorker implements WorkerAgent {
       }
       yield { kind: 'complete', at, partial: false, result: parsed }
     } else {
-      yield {
+      const failed: Extract<WorkerEvent, { kind: 'failed' }> = {
         kind: 'failed',
         at,
         reason: stderr.trim() || `claude subprocess exited with code ${exitCode}`,
         recoverable: false,
       }
+      if (session.terminationMode) failed.terminationMode = session.terminationMode
+      yield failed
     }
   }
 
-  async stop(handle: SessionHandle, reason: string): Promise<void> {
+  stop(handle: SessionHandle, reason: string): Promise<void> {
     const session = this.#requireSession(handle)
-    if (session.state !== 'running' && session.state !== 'starting') return
+    // Concurrent stop() callers get the same promise — no second termination
+    // sequence is started. Checked first so the second call doesn't hit the
+    // state guard below (state is already 'cancelled' by the time we got
+    // here). Identity equality is intentional so callers can dedupe by
+    // reference.
+    if (session.stopPromise) return session.stopPromise
+    // Idempotent for already-terminal sessions (complete/failed/timed_out).
+    if (session.state !== 'running' && session.state !== 'starting') {
+      return Promise.resolve()
+    }
     session.state = 'cancelled'
     session.reason = reason
-    const pid = session.child.pid
-    if (pid != null) {
-      // Positive pid — signal just the child. The child is in the daemon's
-      // process group (no detached: true), so signalling -pid here would
-      // signal the daemon itself.
-      try {
-        process.kill(pid, 'SIGTERM')
-      } catch {
-        /* child already gone */
-      }
+    session.stopPromise = this.#runStopSequence(session)
+    return session.stopPromise
+  }
+
+  async #runStopSequence(session: Session): Promise<void> {
+    const child = session.child
+    // Already exited (race: 'close' fired before stop() ran, or child died on
+    // its own). Nothing to signal.
+    if (child.exitCode !== null || child.signalCode !== null) return
+    // Mid-spawn: pid not yet assigned. The child either spawns successfully
+    // (we'd want to signal, but that path is exotic and not what the test
+    // matrix covers) or fails outright. In both cases the resolved promise
+    // will settle when spawn completes/errors; await that and exit clean.
+    if (child.pid == null) {
+      await session.resolved
+      return
     }
-    await session.resolved
+    // Signals only the parent PID — process-group escalation is deliberately
+    // out of scope for this PR. Tracked in issue #15.
+    if (!this.#trySignal(child, 'SIGTERM')) {
+      // child already gone between the exitCode check and now.
+      return
+    }
+    const exited = new Promise<void>((resolve) => {
+      child.once('exit', () => resolve())
+    })
+    let timerId: ReturnType<typeof setTimeout> | undefined
+    const timedOut = new Promise<'timeout'>((resolve) => {
+      timerId = setTimeout(() => resolve('timeout'), STOP_GRACE_MS)
+    })
+    const winner = await Promise.race<'exit' | 'timeout'>([
+      exited.then(() => 'exit' as const),
+      timedOut,
+    ])
+    if (timerId !== undefined) clearTimeout(timerId)
+    if (winner === 'exit') {
+      session.terminationMode = 'sigterm'
+      return
+    }
+    // SIGKILL is unblockable — exit is imminent. Await it so callers see
+    // stop() resolve only after the child is actually gone.
+    // Parent-PID signal only. ADR-0001:138 specifies SIGKILL to the entire process group;
+    // process-group signaling is deferred to issue #15. The two PRs together satisfy the ADR contract.
+    this.#trySignal(child, 'SIGKILL')
+    await exited
+    session.terminationMode = 'sigkill'
+  }
+
+  #trySignal(child: ChildProcess, signal: NodeJS.Signals): boolean {
+    try {
+      return child.kill(signal)
+    } catch {
+      return false
+    }
   }
 
   #requireSession(handle: SessionHandle): Session {

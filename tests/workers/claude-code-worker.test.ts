@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test'
+import { beforeEach, afterEach, describe, it, mock } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { Readable } from 'node:stream'
@@ -7,6 +7,7 @@ import type { ChildProcess } from 'node:child_process'
 import {
   ClaudeCodeWorker,
   MISSING_API_KEY_MESSAGE,
+  STOP_GRACE_MS,
   buildSpawnEnv,
   buildSpawnPlan,
   resolveApiKey,
@@ -318,6 +319,181 @@ describe('ClaudeCodeWorker — terminal-event mapping (CI, closes #17)', () => {
     if (SAVED_KEY !== undefined) process.env.ANTHROPIC_API_KEY = SAVED_KEY
     else delete process.env.ANTHROPIC_API_KEY
   })
+})
+
+describe('ClaudeCodeWorker — stop() lifecycle (CI, closes #14)', () => {
+  // Controllable fake child for stop() race coverage. Unlike the simple
+  // fakeChild() used by the parse-path tests above, this one:
+  //   - Defers 'close' until we drive it (so stop() races aren't pre-decided
+  //     by the simple fakeChild's setImmediate-close pattern).
+  //   - Records every kill() signal so tests can assert on what stop() sent.
+  //   - Decides per-signal whether to fire 'exit' / 'close', which is how we
+  //     model a child that ignores SIGTERM but cannot escape SIGKILL.
+  //   - Implementation uses child.kill(signal) (not process.kill(pid, signal))
+  //     so this fake intercepts cleanly — no live PIDs are signaled.
+  type Controllable = ChildProcess & {
+    signals: NodeJS.Signals[]
+    fireExit: (code: number, signal?: NodeJS.Signals | null) => void
+  }
+  function controllableChild(opts: {
+    onSigterm?: 'exit' | 'ignore'
+    pid?: number | null
+  } = {}): Controllable {
+    const onSigterm = opts.onSigterm ?? 'exit'
+    const c = new EventEmitter() as Controllable
+    // `pid: null` lets tests model the mid-spawn-no-pid case. Plain omission
+    // gets a default. Cannot use `?? 12345` because that would coerce null to
+    // the default.
+    c.pid = 'pid' in opts ? (opts.pid ?? undefined) : 12345
+    // Stdout/stderr exist but emit nothing (we don't care about parse paths
+    // here — stop() must terminate before the subprocess writes useful output).
+    c.stdout = new Readable({ read() {} }) as ChildProcess['stdout']
+    c.stderr = new Readable({ read() {} }) as ChildProcess['stderr']
+    c.exitCode = null
+    c.signalCode = null
+    c.killed = false
+    c.signals = []
+    c.kill = ((signal?: NodeJS.Signals | number) => {
+      const sig = (typeof signal === 'string' ? signal : 'SIGTERM') as NodeJS.Signals
+      c.signals.push(sig)
+      if (sig === 'SIGTERM' && onSigterm === 'exit') {
+        // Honor the term: fire exit on a microtask so the implementation's
+        // race-arming code has registered its listener first.
+        queueMicrotask(() => c.fireExit(143, 'SIGTERM'))
+      } else if (sig === 'SIGKILL') {
+        // SIGKILL is unblockable.
+        queueMicrotask(() => c.fireExit(137, 'SIGKILL'))
+      }
+      return true
+    }) as ChildProcess['kill']
+    c.fireExit = (code, signal) => {
+      c.exitCode = code
+      if (signal != null) c.signalCode = signal
+      c.killed = true
+      // Read the stdout/stderr we never populated to nudge the worker's
+      // accumulators closed before 'close' fires.
+      ;(c.stdout as Readable).push(null)
+      ;(c.stderr as Readable).push(null)
+      c.emit('exit', code, signal ?? null)
+      // Worker's `resolved` listens on 'close', not 'exit'. Fire both so the
+      // stream() drainer can proceed and assert on terminationMode.
+      queueMicrotask(() => c.emit('close', code, signal ?? null))
+    }
+    return c
+  }
+
+  const ctx: WorkerContext = { env: { ANTHROPIC_API_KEY: 'sk-ant-fake-test-key' } }
+  let SAVED_KEY: string | undefined
+  beforeEach(() => {
+    SAVED_KEY = process.env.ANTHROPIC_API_KEY
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-fake-test-key'
+  })
+  afterEach(() => {
+    if (SAVED_KEY !== undefined) process.env.ANTHROPIC_API_KEY = SAVED_KEY
+    else delete process.env.ANTHROPIC_API_KEY
+  })
+
+  it('stop() called twice → second call returns same promise, only one SIGTERM sent', async () => {
+    const child = controllableChild({ onSigterm: 'exit' })
+    const worker = new ClaudeCodeWorker({ spawnImpl: () => child })
+    const handle = await worker.start(makeSpec(), ctx)
+    const p1 = worker.stop(handle, 'first')
+    const p2 = worker.stop(handle, 'second')
+    assert.strictEqual(p1, p2, 'second stop() must return the same promise reference')
+    await p1
+    assert.deepEqual(child.signals, ['SIGTERM'], 'only one SIGTERM sent for concurrent stop() calls')
+  })
+
+  it('stop() on a child that exits within grace → SIGTERM only, terminationMode=sigterm', async () => {
+    const child = controllableChild({ onSigterm: 'exit' })
+    const worker = new ClaudeCodeWorker({ spawnImpl: () => child })
+    const handle = await worker.start(makeSpec(), ctx)
+    await worker.stop(handle, 'graceful')
+    assert.deepEqual(child.signals, ['SIGTERM'], 'SIGKILL must not be sent when SIGTERM is honored')
+    const ev = await drainTerminal(worker, handle)
+    assert.equal(ev.kind, 'failed')
+    const failed = ev as Extract<WorkerEvent, { kind: 'failed' }>
+    assert.equal(failed.terminationMode, 'sigterm')
+  })
+
+  it('stop() on a child that ignores SIGTERM → SIGKILL after grace, terminationMode=sigkill', async () => {
+    // Fake timers (apis: ['setTimeout'] only — leave setImmediate /
+    // queueMicrotask alone so the controllable child can still drive its
+    // exit emission). This is what keeps the SIGTERM-ignored test in the
+    // millisecond range; a real 10s wait in CI is unacceptable.
+    mock.timers.enable({ apis: ['setTimeout'] })
+    try {
+      const child = controllableChild({ onSigterm: 'ignore' })
+      const worker = new ClaudeCodeWorker({ spawnImpl: () => child })
+      const handle = await worker.start(makeSpec(), ctx)
+      const startedAt = Date.now()
+      const stopPromise = worker.stop(handle, 'budget cap')
+      // Let stop() send SIGTERM and arm its timer.
+      await new Promise<void>((r) => setImmediate(r))
+      assert.deepEqual(child.signals, ['SIGTERM'], 'SIGTERM must be sent before grace elapses')
+      // Advance virtual time past the grace window.
+      mock.timers.tick(STOP_GRACE_MS + 100)
+      await stopPromise
+      // Generous tolerance — we're asserting "did not take wall-clock 10s",
+      // not a precise duration. Anything under a second proves fake timers
+      // are doing their job.
+      assert.ok(
+        Date.now() - startedAt < 1000,
+        `stop() took ${Date.now() - startedAt}ms wall-clock; fake timers not in effect`,
+      )
+      assert.deepEqual(
+        child.signals,
+        ['SIGTERM', 'SIGKILL'],
+        'SIGKILL must be sent after grace when SIGTERM was ignored',
+      )
+      const ev = await drainTerminal(worker, handle)
+      assert.equal(ev.kind, 'failed')
+      const failed = ev as Extract<WorkerEvent, { kind: 'failed' }>
+      assert.equal(failed.terminationMode, 'sigkill')
+    } finally {
+      mock.timers.reset()
+    }
+  })
+
+  it('stop() called after stream() has already terminated naturally → resolves immediately, no signal sent', async () => {
+    // Use the simple fakeSpawn (which pre-buffers stdout via Readable.from) so
+    // the worker sees a clean exit-0 + valid envelope and reaches state
+    // 'complete' before stop() is called. The controllable child's manual
+    // push() pattern races against the close emit and is overkill here.
+    const envelope = { type: 'result', subtype: 'success', is_error: false, result: 'OK' }
+    let killCount = 0
+    const spawnImpl: SpawnFn = () => {
+      const c = fakeChild({ stdout: JSON.stringify(envelope), exitCode: 0 })
+      c.kill = (() => {
+        killCount++
+        return true
+      }) as ChildProcess['kill']
+      return c
+    }
+    const worker = new ClaudeCodeWorker({ spawnImpl })
+    const handle = await worker.start(makeSpec(), ctx)
+    const ev = await drainTerminal(worker, handle)
+    assert.equal(ev.kind, 'complete')
+    // State is now 'complete'. stop() must take the fast path.
+    await worker.stop(handle, 'too late')
+    assert.equal(killCount, 0, 'no signal should be sent after natural termination')
+  })
+
+  it('stop() called mid-spawn (no pid) → resolves once spawn settles, no error on spawn failure', async () => {
+    const child = controllableChild({ pid: null })
+    const worker = new ClaudeCodeWorker({ spawnImpl: () => child })
+    const handle = await worker.start(makeSpec(), ctx)
+    const stopPromise = worker.stop(handle, 'never started')
+    // Simulate spawn failure landing after stop() was called.
+    queueMicrotask(() => child.emit('error', new Error('spawn ENOENT')))
+    await stopPromise
+    assert.deepEqual(
+      child.signals,
+      [],
+      'no kill() should be issued when pid is unknown — wait for spawn to settle instead',
+    )
+  })
+
 })
 
 const RUN_INTEGRATION = process.env.RUN_INTEGRATION_TESTS === '1'
