@@ -4,7 +4,7 @@
 // dollars on the dashboard, a kill switch, legible errors.
 import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
-import { existsSync } from 'node:fs'
+import { existsSync, rmSync } from 'node:fs'
 import { readFile, writeFile, rm, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import os from 'node:os'
@@ -49,7 +49,11 @@ async function loadDotenv(): Promise<void> {
     if (!existsSync(p)) continue
     for (const line of (await readFile(p, 'utf8')).split('\n')) {
       const m = /^([A-Z0-9_]+)=(.*)$/.exec(line.trim())
-      if (m && process.env[m[1]!] === undefined) process.env[m[1]!] = m[2]!
+      if (m && process.env[m[1]!] === undefined) {
+        // Strip standard dotenv quoting — literal quotes in DATABASE_URL
+        // produce a misleading "Postgres unreachable" (review P3-10).
+        process.env[m[1]!] = m[2]!.replace(/^(['"])(.*)\1$/, '$2')
+      }
     }
   }
 }
@@ -103,21 +107,35 @@ async function acquirePidfile(): Promise<void> {
   await mkdir(join(os.homedir(), '.vibe-manager'), { recursive: true })
   if (existsSync(PIDFILE)) {
     const pid = Number((await readFile(PIDFILE, 'utf8')).trim())
-    if (pid > 0) {
-      try {
-        process.kill(pid, 0)
-        throw new KnownError(
-          `another vibe daemon is running (pid ${pid}).\nFix: \`vibe status\` to inspect, \`vibe stop\` to end it, or remove ${PIDFILE} if stale.`,
-        )
-      } catch (err) {
-        if (err instanceof KnownError) throw err
-        // ESRCH — stale pidfile, take over.
-      }
+    if (pid > 0 && (await pidLooksLikeVibe(pid))) {
+      throw new KnownError(
+        `another vibe daemon is running (pid ${pid}).\nFix: \`vibe status\` to inspect, \`vibe stop\` to end it, or remove ${PIDFILE} if stale.`,
+      )
     }
+    // dead or recycled pid — stale pidfile, take over.
   }
   await writeFile(PIDFILE, String(process.pid))
-  const cleanup = () => rm(PIDFILE, { force: true }).catch(() => {})
-  process.once('exit', () => void cleanup())
+  // 'exit' handlers must be synchronous — an async rm never completes before
+  // the process dies and the pidfile leaks on every normal exit (review P1-3).
+  process.once('exit', () => {
+    try { rmSync(PIDFILE, { force: true }) } catch { /* best effort */ }
+  })
+}
+
+// A pid from a (possibly stale) pidfile is only "our daemon" if the live
+// process actually looks like one — never signal a recycled pid (review P1-3).
+async function pidLooksLikeVibe(pid: number): Promise<boolean> {
+  try {
+    process.kill(pid, 0)
+  } catch {
+    return false
+  }
+  try {
+    const { stdout } = await execFileAsync('ps', ['-o', 'command=', '-p', String(pid)])
+    return /node|vibe/.test(stdout)
+  } catch {
+    return false
+  }
 }
 
 function dollars(cents: string | number): string {
@@ -125,7 +143,7 @@ function dollars(cents: string | number): string {
 }
 
 async function cmdRun(args: string[]): Promise<number> {
-  const prompt = args.find((a) => !a.startsWith('--'))
+  const prompt = positional(args)
   const repoPath = argValue(args, '--repo')
   if (!prompt || !repoPath) throw new KnownError('usage: vibe run "<prompt>" --repo <path> [--base-ref <ref>] [--timeout-min <n>] [--budget-cents <n>] [--no-pr]')
 
@@ -197,7 +215,7 @@ async function cmdStatus(args: string[]): Promise<number> {
   const pool = createPool(requireEnv('DATABASE_URL'))
   try {
     const tasks = new TasksRepo(pool)
-    const id = args.find((a) => !a.startsWith('--'))
+    const id = positional(args)
     const asJson = args.includes('--json')
     const roots = id ? [await tasks.get(id)] : await tasks.recentRoots()
     const out: unknown[] = []
@@ -255,12 +273,13 @@ async function cmdStop(args: string[]): Promise<number> {
   //    re-raises). 2. Reap leftovers. 3. Reflect reality in the DB.
   if (existsSync(PIDFILE)) {
     const pid = Number((await readFile(PIDFILE, 'utf8')).trim())
-    try {
+    if (await pidLooksLikeVibe(pid)) {
       process.kill(pid, hard ? 'SIGKILL' : 'SIGTERM')
       console.log(`signaled daemon pid ${pid} (${hard ? 'SIGKILL' : 'SIGTERM'})`)
       await new Promise((r) => setTimeout(r, 1500))
-    } catch {
+    } else {
       console.log('no live daemon (stale pidfile)')
+      rmSync(PIDFILE, { force: true })
     }
   } else {
     console.log('no daemon pidfile found')
@@ -306,9 +325,23 @@ async function cmdReap(args: string[]): Promise<number> {
   return 0
 }
 
+const VALUE_FLAGS = new Set(['--repo', '--base-ref', '--timeout-min', '--budget-cents'])
+
 function argValue(args: string[], flag: string): string | undefined {
   const i = args.indexOf(flag)
   return i >= 0 ? args[i + 1] : undefined
+}
+
+// First token that is neither a flag nor a value-taking flag's value —
+// `vibe run --repo /p "do x"` must not treat /p as the prompt (review P2-7).
+function positional(args: string[]): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!
+    if (VALUE_FLAGS.has(a)) { i++; continue }
+    if (a.startsWith('--')) continue
+    return a
+  }
+  return undefined
 }
 
 async function main(): Promise<number> {

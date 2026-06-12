@@ -39,15 +39,19 @@ export class TasksRepo {
   }): Promise<TaskRow> {
     const id = randomUUID()
     return withRetry('tasks.createRoot', async () => {
+      // on conflict DO NOTHING covers BOTH the idempotency_key dedup (#42)
+      // and a retried ambiguous write re-inserting our client-minted id
+      // (review P3-9) — either conflict falls through to the lookups below.
       const r = await this.#pool.query(
         `insert into vibe_manager.tasks (id, root_task_id, title, description, created_by_agent, idempotency_key)
          values ($1, $1, $2, $3, 'human', $4)
-         on conflict (idempotency_key) do nothing
+         on conflict do nothing
          returning *`,
         [id, input.title, input.description, input.idempotencyKey ?? null],
       )
       if (r.rows[0]) return r.rows[0] as TaskRow
-      // idempotency_key conflict — return the existing row (restart dedup, #42).
+      const byId = await this.#pool.query(`select * from vibe_manager.tasks where id = $1`, [id])
+      if (byId.rows[0]) return byId.rows[0] as TaskRow
       const existing = await this.#pool.query(
         `select * from vibe_manager.tasks where idempotency_key = $1`,
         [input.idempotencyKey],

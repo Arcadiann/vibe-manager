@@ -94,8 +94,16 @@ export async function runRoot(deps: DispatcherDeps, opts: RunOptions): Promise<R
     return { rootTaskId: root.id, status: 'blocked', taskSummaries: [] }
   }
 
-  // ── Manager: decompose into the task graph.
-  const { decomposition, order } = await deps.manager.decompose(opts.prompt, opts.repoPath)
+  // ── Manager: decompose into the task graph. A throw (graph_invalid,
+  // llm_output_invalid) must not strand the root row in 'pending' (P2-5).
+  let decomposition, order
+  try {
+    ;({ decomposition, order } = await deps.manager.decompose(opts.prompt, opts.repoPath))
+  } catch (err) {
+    await deps.tasks.setStatus(root.id, 'failed', { reason: String(err) })
+    await deps.events.append({ kind: 'run_completed', taskId: root.id, rootTaskId: root.id, payloadSummary: `failed: ${String(err).slice(0, 160)}` })
+    return { rootTaskId: root.id, status: 'failed', taskSummaries: [] }
+  }
   const childRows: TaskRow[] = []
   for (const t of decomposition.tasks) {
     const row = await deps.tasks.createChild({
@@ -127,8 +135,8 @@ export async function runRoot(deps: DispatcherDeps, opts: RunOptions): Promise<R
   // baseRefs along dependency edges (plan §4b-2: linear chaining; a task with
   // exactly one dependency branches from that dependency's branch tip).
   const baseRef = opts.baseRef ?? (await defaultBaseRef(opts.repoPath))
-  const branchByIndex = new Map<number, string>()
   const results: Array<{ id: string; title: string; status: string; resultSummary: string }> = []
+  const completedWorkspaces: WorkspaceHandle[] = []
   let lastBranch: string | null = null
   let anyFailed = false
 
@@ -140,16 +148,19 @@ export async function runRoot(deps: DispatcherDeps, opts: RunOptions): Promise<R
       results.push({ id: row.id, title: spec.title, status: 'cancelled', resultSummary: 'skipped: upstream failure' })
       continue
     }
-    const deps1 = spec.dependsOn
-    const taskBaseRef =
-      deps1.length === 1 && branchByIndex.has(deps1[0]!)
-        ? branchByIndex.get(deps1[0]!)!
-        : baseRef
+    // Sequential lineage (review P1-2): every task branches from the PREVIOUS
+    // completed task's branch tip, regardless of declared edges — with
+    // sequential execution this guarantees the final branch accumulates ALL
+    // completed work (nothing silently dropped from the PR) and that
+    // multi-dependency tasks see their dependencies' code. dependsOn still
+    // controls ordering and failure cancellation. True per-edge isolation
+    // returns with M4a concurrency.
+    const taskBaseRef = lastBranch ?? baseRef
     const outcome = await executeTask(deps, opts, row, spec.title, taskBaseRef, log)
     results.push({ id: row.id, title: spec.title, status: outcome.status, resultSummary: outcome.summary })
     if (outcome.status === 'complete' && outcome.branch) {
-      branchByIndex.set(idx, outcome.branch)
       lastBranch = outcome.branch
+      if (outcome.ws) completedWorkspaces.push(outcome.ws)
     } else {
       anyFailed = true
     }
@@ -161,10 +172,16 @@ export async function runRoot(deps: DispatcherDeps, opts: RunOptions): Promise<R
   let prUrl: string | undefined
   const rootStatus: 'complete' | 'failed' = anyFailed ? 'failed' : 'complete'
   if (!anyFailed && lastBranch && opts.openPr !== false) {
-    const synth = await deps.manager.synthesize({
-      prompt: opts.prompt,
-      results: results.map((r) => ({ title: r.title, status: r.status, resultSummary: r.resultSummary })),
-    })
+    let synth
+    try {
+      synth = await deps.manager.synthesize({
+        prompt: opts.prompt,
+        results: results.map((r) => ({ title: r.title, status: r.status, resultSummary: r.resultSummary })),
+      })
+    } catch (err) {
+      // Work is done and committed locally; only the narrative failed (P2-5).
+      synth = { prTitle: opts.prompt.slice(0, 80), prBody: `Automated run (synthesis failed: ${String(err).slice(0, 200)}).\n\nTasks:\n${results.map((r) => `- [${r.status}] ${r.title}`).join('\n')}`, usage: { inputTokens: 0, outputTokens: 0 } }
+    }
     await deps.events.append({
       kind: 'synthesis',
       taskId: root.id,
@@ -203,6 +220,17 @@ export async function runRoot(deps: DispatcherDeps, opts: RunOptions): Promise<R
     }
   }
 
+  // Deferred teardown of completed workspaces (P1-1): the PR is open (or
+  // skipped) — the worktrees and local branches are no longer needed. The
+  // pushed remote branch is what the PR rides on.
+  for (const cws of completedWorkspaces) {
+    try {
+      await deps.runtime.teardown(cws)
+    } catch (err) {
+      log(`[vibe] teardown of completed workspace ${cws.id} failed (reap later): ${String(err)}`)
+    }
+  }
+
   await deps.tasks.setStatus(root.id, rootStatus, anyFailed ? { reason: 'one or more tasks failed' } : {})
   await deps.events.append({
     kind: 'run_completed',
@@ -230,7 +258,7 @@ async function executeTask(
   title: string,
   taskBaseRef: string,
   log: (line: string) => void,
-): Promise<{ status: 'complete' | 'failed' | 'timed_out'; summary: string; branch?: string }> {
+): Promise<{ status: 'complete' | 'failed' | 'timed_out'; summary: string; branch?: string; ws?: WorkspaceHandle }> {
   const timeoutMs = opts.taskTimeoutMs ?? DEFAULT_TIMEOUT_MS
   const budgetCents = opts.taskBudgetCents ?? DEFAULT_BUDGET_CENTS
   const caps = deps.worker.capabilities()
@@ -362,7 +390,12 @@ async function executeTask(
         await deps.worker.stop(handle, 'timeoutMs exceeded')
         return
       }
-      if (Date.now() - lastEventAt > HEARTBEAT_INTERVAL_MS * 3) {
+      // ADR-0001's zombie rule is about worker EMISSION, not dispatcher
+      // consumption — status().lastEventAt is the channel the ADR provides
+      // (a slow DB write must not zombie a healthy worker, review P3-11).
+      const st = await deps.worker.status(handle).catch(() => null)
+      const emittedAt = st?.lastEventAt ?? lastEventAt
+      if (Date.now() - Math.max(emittedAt, lastEventAt) > HEARTBEAT_INTERVAL_MS * 3) {
         stopReason = 'zombie'
         await deps.worker.stop(handle, 'zombie: no events for 3x heartbeat interval')
         return
@@ -370,7 +403,19 @@ async function executeTask(
     }
   })()
 
-  await consume
+  try {
+    await consume
+  } catch (err) {
+    // Persistence (or router) failure mid-stream (P2-4): the detached worker
+    // must not keep spending unsupervised. Stop it, mark the task failed
+    // loudly, preserve the workspace, and end the stream.
+    sawTerminal = true // stops the watchdog
+    try { await deps.worker.stop(handle, `orchestrator error: ${String(err)}`) } catch { /* best effort */ }
+    try { await deps.tasks.setStatus(row.id, 'failed', { reason: `orchestrator_error: ${String(err)}` }) } catch { /* db may be the failure */ }
+    try { await deps.runtime.teardown(ws, { preserve: true }) } catch { /* reap later */ }
+    await watchdog.catch(() => {})
+    return { status: 'failed', summary: `orchestrator_error: ${String(err)}` }
+  }
   // Watchdog exits promptly once sawTerminal flips (1s poll).
   await watchdog
 
@@ -436,12 +481,16 @@ async function executeTask(
     payloadSummary: `${finalStatus}${reason ? `: ${reason.slice(0, 160)}` : ''}`,
   })
 
-  // Teardown policy (review A14): preserve failed/timed_out for post-mortem.
-  const preserve = finalStatus !== 'complete'
-  try {
-    await deps.runtime.teardown(ws, { preserve })
-  } catch (err) {
-    log(`[vibe] task ${title}: teardown failed (workspace left for reap): ${String(err)}`)
+  // Teardown policy (review A14 + P1-1): failed/timed_out are preserved for
+  // post-mortem NOW; completed workspaces are NOT torn down here — teardown
+  // deletes the branch, which the next task's baseRef and the final push
+  // still need. runRoot tears completed workspaces down after the PR step.
+  if (finalStatus !== 'complete') {
+    try {
+      await deps.runtime.teardown(ws, { preserve: true })
+    } catch (err) {
+      log(`[vibe] task ${title}: teardown failed (workspace left for reap): ${String(err)}`)
+    }
   }
 
   log(`[vibe] task ${title}: ${finalStatus}${reason ? ` (${reason.slice(0, 120)})` : ''} — ${spentCents.toFixed(4)}¢`)
@@ -454,6 +503,6 @@ async function executeTask(
         : 'completed'
       : reason ?? 'failed'
   return finalStatus === 'complete'
-    ? { status: 'complete', summary, branch: ws.branch }
+    ? { status: 'complete', summary, branch: ws.branch, ws }
     : { status: finalStatus, summary }
 }

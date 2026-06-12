@@ -66,6 +66,9 @@ Rules:
 export function validateGraph(d: Decomposition): { ok: true; order: number[] } | { ok: false; reason: string } {
   const n = d.tasks.length
   if (n === 0) return { ok: false, reason: 'empty decomposition' }
+  // Normalize: LLMs can emit duplicate edges; duplicates would inflate
+  // in-degrees below and report a false cycle (review P3-8).
+  for (const t of d.tasks) t.dependsOn = [...new Set(t.dependsOn)]
   for (let i = 0; i < n; i++) {
     for (const dep of d.tasks[i]!.dependsOn) {
       if (!Number.isInteger(dep) || dep < 0 || dep >= n) {

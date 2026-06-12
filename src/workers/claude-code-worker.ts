@@ -244,9 +244,12 @@ export class ClaudeCodeWorker implements WorkerAgent {
     return {
       workerType: 'claude-code',
       modelId: 'claude-opus-4-7',
-      maxContextTokens: 200_000,
-      costPerMillionInputTokens: 1500,
-      costPerMillionOutputTokens: 7500,
+      // Per the current model catalog: \$5/\$25 per MTok, 1M context. These
+      // feed budget enforcement and the \$-dashboard — wrong values trip the
+      // budget floor early and overstate month-to-date spend (review P2-6).
+      maxContextTokens: 1_000_000,
+      costPerMillionInputTokens: 500,
+      costPerMillionOutputTokens: 2500,
       supportsStreaming: false,
       supportsToolUse: true,
       declaredLanguages: null,
