@@ -54,7 +54,8 @@ Rules:
 - Each task description must be a complete, self-contained prompt for a coding agent: what to change, where, and what done looks like. Workers see ONLY their task description.
 - Express ordering with dependsOn (indexes into your own tasks array). A task that builds on another task's output MUST depend on it.
 - Keep the graph minimal: 1-4 tasks. Do not pad. Do not create cycles.
-- Workers cannot talk to each other; anything a downstream task needs must be stated in its description.`
+- Workers cannot talk to each other; anything a downstream task needs must be stated in its description.
+- Refer to files by repository-relative paths only (e.g. README.md, src/app.ts). NEVER include absolute filesystem paths in task descriptions — each worker has its own isolated checkout and an absolute path would point outside it.`
 
 const SYNTH_SYSTEM = `You are the Technical Manager Agent. The decomposed tasks have finished executing. Write the pull request title and body that presents the combined work to the human reviewer.
 

@@ -187,6 +187,17 @@ export class GitWorktreeRuntime implements WorkerRuntime {
         }
         await mkdir(join(dir, '.vibe'), { recursive: true })
         await writeFile(join(dir, '.vibe', 'workspace.json'), JSON.stringify(meta, null, 2))
+        // Hide runtime metadata from git: a worker's `git add -A` must not
+        // sweep .vibe/ into its commits (smoke run #56 shipped proc.json
+        // into the PR). info/exclude lives in the COMMON git dir and covers
+        // all worktrees of the base repo; never touches tracked files.
+        const excludeRel = (await git(['rev-parse', '--git-path', 'info/exclude'], dir)).trim()
+        const excludePath = excludeRel.startsWith('/') ? excludeRel : join(dir, excludeRel)
+        const existing = await readFile(excludePath, 'utf8').catch(() => '')
+        if (!existing.includes('.vibe/')) {
+          await mkdir(join(excludePath, '..'), { recursive: true }).catch(() => {})
+          await writeFile(excludePath, existing + '.vibe/' + String.fromCharCode(10))
+        }
       } catch (err) {
         // Roll back: a worktree without workspace.json is invisible to
         // listWorkspaces/reap but its branch blocks every retry — the worst
