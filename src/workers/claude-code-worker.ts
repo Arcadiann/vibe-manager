@@ -1,21 +1,4 @@
-import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-
-// Constructor-injected spawn for the parse-path tests in issue #17 and beyond.
-// Picked function-pointer-via-constructor over a module-level mutable export
-// because (a) it keeps test state local to the worker instance under test —
-// no shared mutable module state to reset between tests — and (b) the
-// WorkerAgent interface is unaffected: the constructor is implementation-
-// private, callers still do `new ClaudeCodeWorker()` with no args.
-export type SpawnFn = (
-  command: string,
-  args: readonly string[],
-  options: SpawnOptions,
-) => ChildProcess
-
-export type ClaudeCodeWorkerOptions = {
-  spawnImpl?: SpawnFn
-}
 
 import type {
   SessionHandle,
@@ -26,13 +9,29 @@ import type {
   WorkerEvent,
   WorkerStatusReport,
 } from './types.ts'
+import type {
+  ExecExit,
+  ExecHandle,
+  ExecSpec,
+  WorkerRuntime,
+  WorkspaceHandle,
+} from '../runtime/types.ts'
+
+// Constructor-injected WorkerRuntime per ADR-0004: the worker owns the Claude
+// Code *protocol* (args, env allowlist, envelope parsing, stop-grace policy);
+// the runtime owns *placement* (where processes run and how they die). Tests
+// inject a fake runtime returning fake ExecHandles — the same seam pattern
+// the pre-ADR-0004 worker used for spawn, one level up.
+export type ClaudeCodeWorkerOptions = {
+  runtime: WorkerRuntime
+}
 
 // Grace window between SIGTERM and SIGKILL inside stop(). Matches ADR-0001
 // §"Lifecycle" (10s default): long enough for a well-behaved subprocess to
 // flush stdout, write final tokens, and exit cleanly; short enough that a
 // hung child can't deadlock the orchestrator's stop path or daemon shutdown.
-// Not configurable per call in this PR — single project-wide default until
-// orchestrator design surfaces a real per-task tuning requirement.
+// Not configurable per call — single project-wide default until orchestrator
+// design surfaces a real per-task tuning requirement.
 export const STOP_GRACE_MS = 10_000
 
 // Debounced heartbeat tick cadence. Matches the worker-specific cadence in
@@ -49,12 +48,6 @@ export const MISSING_API_KEY_MESSAGE =
   'ClaudeCodeWorker requires ANTHROPIC_API_KEY in the daemon process environment ' +
   'before instantiation. See ADR-0002: the worker tier is API-key-only and the ' +
   'subprocess MUST NOT fall back to ~/.claude/.credentials.json or the OS keychain.'
-
-export type SpawnPlan = {
-  command: string
-  args: string[]
-  options: SpawnOptions
-}
 
 // Resolves the API key for a single start() call. WorkerContext.env wins when
 // it carries a non-empty ANTHROPIC_API_KEY; empty-string or absent falls back
@@ -98,6 +91,9 @@ export function resolveApiKey(
 //     and the DEFAULT_*_MODEL family, SMALL_FAST_MODEL, CUSTOM_MODEL_OPTION,
 //     BETAS, CLAUDE_CODE_SUBSCRIPTION_TYPE, MAX_OUTPUT_TOKENS,
 //     MAX_CONTEXT_TOKENS).
+//   - GH_TOKEN, GITHUB_TOKEN, SSH_AUTH_SOCK: pushing branches and opening PRs
+//     is the DISPATCHER's job from the daemon env (ADR-0004 / plan §4b-8) —
+//     the worker subprocess gets no publish credentials.
 //   - 3P provider credentials (AWS_BEARER_TOKEN_BEDROCK, AWS_* generally,
 //     GOOGLE_APPLICATION_CREDENTIALS, ANTHROPIC_FOUNDRY_API_KEY, etc.):
 //     same risk — would let the spawned `claude` route spend through a
@@ -155,7 +151,7 @@ export type UsageExtractResult =
 // Cheap-version scope: this only runs on successful envelopes (is_error =
 // false). Failed envelopes that carry partial usage are not billed in this
 // model — fixing that requires --output-format stream-json to track usage as
-// it accumulates, which is deferred to the p3 follow-up.
+// it accumulates, which is deferred to the p3 follow-up (#26).
 export function extractTokensEvent(usage: unknown, at: number): UsageExtractResult {
   if (usage == null) return { kind: 'missing' }
   if (typeof usage !== 'object') {
@@ -183,29 +179,43 @@ export function extractTokensEvent(usage: unknown, at: number): UsageExtractResu
   return { kind: 'ok', event }
 }
 
-// Pure builder for the subprocess invocation. Exported so the regression test
-// can assert on args (specifically --bare presence) without spawning anything.
-export function buildSpawnPlan(spec: TaskSpec, apiKey: string): SpawnPlan {
-  const args = ['-p', '--bare', '--output-format', 'json', spec.description]
-  // No detached: true — the child stays in the daemon's process group so it
-  // dies with the daemon. Orphaned workers would keep billing against the API
-  // key with no supervisor to stop them.
-  const options: SpawnOptions = {
-    cwd: spec.workingDirectory ?? undefined,
+// Pure builder for the worker's exec invocation (the ADR-0004 successor of
+// buildSpawnPlan). Exported so regression tests can assert on args
+// (specifically --bare presence) and env without executing anything.
+// Placement details (cwd default, detachment, process groups) are the
+// runtime's concern and deliberately absent here.
+export function buildExecSpec(spec: TaskSpec, apiKey: string): ExecSpec {
+  const out: ExecSpec = {
+    command: 'claude',
+    args: ['-p', '--bare', '--output-format', 'json', spec.description],
     env: buildSpawnEnv(apiKey),
-    stdio: ['ignore', 'pipe', 'pipe'],
   }
-  return { command: 'claude', args, options }
+  if (spec.workingDirectory != null) out.cwd = spec.workingDirectory
+  return out
+}
+
+// Workspace handle for runs where the dispatcher did not provision one
+// (protocol tests, unmanaged direct runs). Marked so GitWorktreeRuntime skips
+// proc.json bookkeeping — an unmanaged cwd is not a managed workspace and
+// must never be torn down or reaped. ADR-0004 rejected *disguising* paths as
+// managed handles; this one is honest about what it is.
+export function unmanagedWorkspace(spec: TaskSpec): WorkspaceHandle {
+  const path = spec.workingDirectory ?? process.cwd()
+  return { id: `unmanaged:${path}`, path, branch: '' }
 }
 
 type Session = {
-  child: ChildProcess
+  exec: ExecHandle
   startedAt: number
   lastEventAt: number
   state: WorkerStatusReport['state']
   reason: string | null
-  // Resolves when the subprocess closes. Stream/status read from this.
-  resolved: Promise<{ exitCode: number; stdout: string; stderr: string }>
+  // Resolves when the subprocess exits (ExecHandle.wait + drained stdio).
+  // Stream/status read from this.
+  resolved: Promise<{ exit: ExecExit; stdout: string; stderr: string }>
+  // Set once `resolved` settles — stop() consults it instead of poking at
+  // runtime internals (the pre-ADR-0004 worker read child.exitCode).
+  exited: boolean
   // In-flight stop() promise — used to dedupe concurrent stop() calls so a
   // second caller gets the same promise rather than starting a second
   // termination sequence.
@@ -216,22 +226,18 @@ type Session = {
   terminationMode?: 'sigterm' | 'sigkill'
 }
 
-// child_process.spawn is preferred over execFile here: execFile buffers stdout
-// into a 1 MB default that an --output-format json result can plausibly exceed
-// once tool-call payloads are folded in, and spawn keeps the door open for a
-// future move to --output-format stream-json without re-plumbing.
 export class ClaudeCodeWorker implements WorkerAgent {
   readonly #apiKey: string
-  readonly #spawn: SpawnFn
+  readonly #runtime: WorkerRuntime
   readonly #sessions = new Map<SessionHandle, Session>()
 
-  constructor(opts: ClaudeCodeWorkerOptions = {}) {
+  constructor(opts: ClaudeCodeWorkerOptions) {
     const key = process.env.ANTHROPIC_API_KEY
     if (key == null || key.length === 0) {
       throw new Error(MISSING_API_KEY_MESSAGE)
     }
     this.#apiKey = key
-    this.#spawn = opts.spawnImpl ?? spawn
+    this.#runtime = opts.runtime
   }
 
   capabilities(): WorkerCapabilities {
@@ -250,49 +256,58 @@ export class ClaudeCodeWorker implements WorkerAgent {
 
   async start(spec: TaskSpec, ctx: WorkerContext): Promise<SessionHandle> {
     const apiKey = resolveApiKey(ctx, this.#apiKey)
-    const plan = buildSpawnPlan(spec, apiKey)
-    const child = this.#spawn(plan.command, plan.args, plan.options)
+    const execSpec = buildExecSpec(spec, apiKey)
+    const ws = ctx.workspace ?? unmanagedWorkspace(spec)
+    const exec = await this.#runtime.exec(ws, execSpec)
 
-    const handle: SessionHandle = `claude-code:${child.pid ?? 'nopid'}:${randomUUID()}`
+    const handle: SessionHandle = `claude-code:${exec.pid ?? 'nopid'}:${randomUUID()}`
 
     let stdout = ''
     let stderr = ''
-    child.stdout?.setEncoding('utf8').on('data', (chunk: string) => {
+    exec.stdout?.setEncoding?.('utf8')
+    exec.stderr?.setEncoding?.('utf8')
+    exec.stdout?.on('data', (chunk: string) => {
       stdout += chunk
     })
-    child.stderr?.setEncoding('utf8').on('data', (chunk: string) => {
+    exec.stderr?.on('data', (chunk: string) => {
       stderr += chunk
     })
 
-    const resolved = new Promise<{ exitCode: number; stdout: string; stderr: string }>(
-      (resolve) => {
-        child.on('close', (code) => {
-          resolve({ exitCode: code ?? -1, stdout, stderr })
-        })
-        child.on('error', (err) => {
-          resolve({ exitCode: -1, stdout, stderr: stderr + String(err) })
-        })
-      }
+    const resolved = exec.wait().then(
+      (exit) => ({ exit, stdout, stderr }),
+      // Pre-exec failure (spawn ENOENT etc.) — same terminal shape as a
+      // non-zero exit so downstream mapping stays uniform.
+      (err: unknown) => ({
+        exit: { exitCode: -1, signal: null } as ExecExit,
+        stdout,
+        stderr: stderr + String(err),
+      }),
     )
 
     const session: Session = {
-      child,
+      exec,
       startedAt: Date.now(),
       lastEventAt: Date.now(),
       state: 'running',
       reason: null,
       resolved,
+      exited: false,
     }
     this.#sessions.set(handle, session)
 
-    void resolved.then(({ exitCode, stderr: errOut }) => {
+    void resolved.then(({ exit, stderr: errOut }) => {
       session.lastEventAt = Date.now()
+      session.exited = true
       if (session.state === 'cancelled') return
-      if (exitCode === 0) {
+      if (exit.exitCode === 0) {
         session.state = 'complete'
       } else {
         session.state = 'failed'
-        session.reason = errOut.trim() || `claude subprocess exited with code ${exitCode}`
+        session.reason =
+          errOut.trim() ||
+          (exit.signal != null
+            ? `claude subprocess killed by ${exit.signal}`
+            : `claude subprocess exited with code ${exit.exitCode}`)
       }
     })
 
@@ -359,9 +374,9 @@ export class ClaudeCodeWorker implements WorkerAgent {
     }
 
     const driveCompletion = async () => {
-      const { exitCode, stdout, stderr } = await session.resolved
+      const { exit, stdout, stderr } = await session.resolved
       const at = Date.now()
-      if (exitCode === 0) {
+      if (exit.exitCode === 0) {
         let parsed: unknown
         try {
           parsed = JSON.parse(stdout)
@@ -419,10 +434,8 @@ export class ClaudeCodeWorker implements WorkerAgent {
         // Closes #13: emit one `tokens` event from the successful envelope's
         // usage block before `complete` so the orchestrator has end-of-task
         // accounting even without stream-json incremental reporting.
-        // ADR-0001:111 calls this the "low-fidelity" path; a future PR (p3
-        // follow-up) will switch to --output-format stream-json for the
-        // high-fidelity path Claude Code was declared to satisfy
-        // (ADR-0001:178).
+        // ADR-0001:111 calls this the "low-fidelity" path; #26 is the
+        // stream-json upgrade to the high-fidelity path.
         const tokens = extractTokensEvent(envelope!.usage, at)
         if (tokens.kind === 'ok') {
           enqueue(tokens.event)
@@ -440,7 +453,11 @@ export class ClaudeCodeWorker implements WorkerAgent {
         const failed: Extract<WorkerEvent, { kind: 'failed' }> = {
           kind: 'failed',
           at,
-          reason: stderr.trim() || `claude subprocess exited with code ${exitCode}`,
+          reason:
+            stderr.trim() ||
+            (exit.signal != null
+              ? `claude subprocess killed by ${exit.signal}`
+              : `claude subprocess exited with code ${exit.exitCode}`),
           recoverable: false,
         }
         if (session.terminationMode) failed.terminationMode = session.terminationMode
@@ -492,27 +509,33 @@ export class ClaudeCodeWorker implements WorkerAgent {
   }
 
   async #runStopSequence(session: Session): Promise<void> {
-    const child = session.child
-    // Already exited (race: 'close' fired before stop() ran, or child died on
-    // its own). Nothing to signal.
-    if (child.exitCode !== null || child.signalCode !== null) return
-    // Mid-spawn: pid not yet assigned. The child either spawns successfully
-    // (we'd want to signal, but that path is exotic and not what the test
-    // matrix covers) or fails outright. In both cases the resolved promise
-    // will settle when spawn completes/errors; await that and exit clean.
-    if (child.pid == null) {
+    // Already exited (race: wait() settled before stop() ran, or the child
+    // died on its own). Nothing to signal.
+    if (session.exited) return
+    // Mid-spawn: pid not yet assigned. The exec either settles successfully
+    // (exotic) or fails outright; in both cases `resolved` settles — await it
+    // and exit clean rather than signaling a pid we don't have.
+    if (session.exec.pid == null) {
       await session.resolved
       return
     }
-    // Signals only the parent PID — process-group escalation is deliberately
-    // out of scope for this PR. Tracked in issue #15.
-    if (!this.#trySignal(child, 'SIGTERM')) {
-      // child already gone between the exitCode check and now.
+    // Group-first signaling per ADR-0004 §signal escalation: SIGTERM the
+    // whole group up front (grandchildren get the graceful signal too), then
+    // SIGKILL the group on grace expiry. Signaling the group from step one
+    // minimizes the pgid-reuse window between leader death and group kill;
+    // the residual TOCTOU is documented as accepted. Closes #15.
+    // terminationMode is written BEFORE the signal that will cause the exit:
+    // driveCompletion reads it from the same `resolved` settlement that the
+    // signal triggers, so writing it after the await would race the read
+    // (caught by the stop()-mid-stream heartbeat test when wait() unified the
+    // old exit/close two-step into one promise).
+    session.terminationMode = 'sigterm'
+    if (!session.exec.signal('SIGTERM', { group: true })) {
+      // Nothing left to signal — group already gone between the exited check
+      // and now.
       return
     }
-    const exited = new Promise<void>((resolve) => {
-      child.once('exit', () => resolve())
-    })
+    const exited = session.resolved.then(() => undefined)
     let timerId: ReturnType<typeof setTimeout> | undefined
     const timedOut = new Promise<'timeout'>((resolve) => {
       timerId = setTimeout(() => resolve('timeout'), STOP_GRACE_MS)
@@ -522,25 +545,12 @@ export class ClaudeCodeWorker implements WorkerAgent {
       timedOut,
     ])
     if (timerId !== undefined) clearTimeout(timerId)
-    if (winner === 'exit') {
-      session.terminationMode = 'sigterm'
-      return
-    }
-    // SIGKILL is unblockable — exit is imminent. Await it so callers see
-    // stop() resolve only after the child is actually gone.
-    // Parent-PID signal only. ADR-0001:138 specifies SIGKILL to the entire process group;
-    // process-group signaling is deferred to issue #15. The two PRs together satisfy the ADR contract.
-    this.#trySignal(child, 'SIGKILL')
-    await exited
+    if (winner === 'exit') return
+    // SIGKILL the group — unblockable, exit is imminent. Await the exit so
+    // callers see stop() resolve only after the child is actually gone.
     session.terminationMode = 'sigkill'
-  }
-
-  #trySignal(child: ChildProcess, signal: NodeJS.Signals): boolean {
-    try {
-      return child.kill(signal)
-    } catch {
-      return false
-    }
+    session.exec.signal('SIGKILL', { group: true })
+    await exited
   }
 
   #requireSession(handle: SessionHandle): Session {

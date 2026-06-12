@@ -1,8 +1,6 @@
 import { beforeEach, afterEach, describe, it, mock } from 'node:test'
 import assert from 'node:assert/strict'
-import { EventEmitter } from 'node:events'
 import { Readable } from 'node:stream'
-import type { ChildProcess } from 'node:child_process'
 
 import {
   ClaudeCodeWorker,
@@ -10,31 +8,54 @@ import {
   MISSING_API_KEY_MESSAGE,
   STOP_GRACE_MS,
   buildSpawnEnv,
-  buildSpawnPlan,
+  buildExecSpec,
   resolveApiKey,
-  type SpawnFn,
+  unmanagedWorkspace,
 } from '../../src/workers/claude-code-worker.ts'
 import type { TaskSpec, WorkerContext, WorkerEvent } from '../../src/workers/types.ts'
+import type { ExecExit, ExecHandle, WorkerRuntime } from '../../src/runtime/types.ts'
+import { GitWorktreeRuntime } from '../../src/runtime/git-worktree-runtime.ts'
 
-// Build a minimal fake ChildProcess: stdout/stderr as Readables that emit the
-// provided strings then end; 'close' fires on the next tick with exitCode.
-function fakeChild(opts: { stdout?: string; stderr?: string; exitCode: number }): ChildProcess {
-  const emitter = new EventEmitter() as ChildProcess
-  ;(emitter as { pid?: number }).pid = 12345
-  emitter.stdout = Readable.from([opts.stdout ?? '']) as ChildProcess['stdout']
-  emitter.stderr = Readable.from([opts.stderr ?? '']) as ChildProcess['stderr']
-  // Defer close until both streams have finished pumping into the worker's
-  // 'data' handlers, otherwise the close fires before stdout is read.
-  setImmediate(() => {
-    setImmediate(() => {
-      emitter.emit('close', opts.exitCode)
-    })
-  })
-  return emitter
+// ADR-0004 seam: the worker is constructed with a WorkerRuntime and calls
+// runtime.exec() — tests inject a fake runtime returning fake ExecHandles.
+// Same testing pattern the pre-ADR-0004 worker used for SpawnFn, one level up.
+
+// Minimal fake ExecHandle: stdout/stderr as Readables that emit the provided
+// strings then end; wait() resolves on a double-setImmediate so the worker's
+// 'data' handlers have drained the streams first (mirrors the runtime's
+// drain-before-resolve contract).
+function fakeHandle(opts: {
+  stdout?: string
+  stderr?: string
+  exitCode: number
+  signal?: string | null
+}): ExecHandle {
+  return {
+    pid: 12345,
+    pgid: 12345,
+    stdout: Readable.from([opts.stdout ?? '']),
+    stderr: Readable.from([opts.stderr ?? '']),
+    wait: () =>
+      new Promise<ExecExit>((resolve) => {
+        setImmediate(() => {
+          setImmediate(() => resolve({ exitCode: opts.exitCode, signal: opts.signal ?? null }))
+        })
+      }),
+    signal: () => true,
+  }
 }
 
-function fakeSpawn(opts: { stdout?: string; stderr?: string; exitCode: number }): SpawnFn {
-  return () => fakeChild(opts)
+function fakeRuntime(handle: ExecHandle | (() => ExecHandle)): WorkerRuntime {
+  return {
+    createWorkspace: () => Promise.reject(new Error('not under test')),
+    exec: async () => (typeof handle === 'function' ? handle() : handle),
+    teardown: async () => {},
+    listWorkspaces: async () => [],
+  }
+}
+
+function workerWith(handle: ExecHandle | (() => ExecHandle)): ClaudeCodeWorker {
+  return new ClaudeCodeWorker({ runtime: fakeRuntime(handle) })
 }
 
 async function drainTerminal(worker: ClaudeCodeWorker, handle: string): Promise<WorkerEvent> {
@@ -62,7 +83,7 @@ describe('ClaudeCodeWorker — env injection (CI)', () => {
     const saved = process.env.ANTHROPIC_API_KEY
     delete process.env.ANTHROPIC_API_KEY
     try {
-      assert.throws(() => new ClaudeCodeWorker(), (err: unknown) => {
+      assert.throws(() => workerWith(fakeHandle({ exitCode: 0 })), (err: unknown) => {
         assert.ok(err instanceof Error)
         assert.match(err.message, /ANTHROPIC_API_KEY/)
         assert.equal(err.message, MISSING_API_KEY_MESSAGE)
@@ -77,41 +98,41 @@ describe('ClaudeCodeWorker — env injection (CI)', () => {
     const saved = process.env.ANTHROPIC_API_KEY
     process.env.ANTHROPIC_API_KEY = ''
     try {
-      assert.throws(() => new ClaudeCodeWorker(), /ANTHROPIC_API_KEY/)
+      assert.throws(() => workerWith(fakeHandle({ exitCode: 0 })), /ANTHROPIC_API_KEY/)
     } finally {
       if (saved !== undefined) process.env.ANTHROPIC_API_KEY = saved
       else delete process.env.ANTHROPIC_API_KEY
     }
   })
 
-  it('spawn plan always includes --bare (regression guard for ADR-0002)', () => {
-    const plan = buildSpawnPlan(makeSpec(), 'sk-ant-fake-test-key')
-    assert.equal(plan.command, 'claude')
-    assert.ok(plan.args.includes('--bare'), `expected --bare in args: ${plan.args.join(' ')}`)
-    assert.ok(plan.args.includes('-p'), '`-p` (print) flag required for non-interactive use')
-    const fmtIdx = plan.args.indexOf('--output-format')
+  it('exec spec always includes --bare (regression guard for ADR-0002)', () => {
+    const spec = buildExecSpec(makeSpec(), 'sk-ant-fake-test-key')
+    assert.equal(spec.command, 'claude')
+    assert.ok(spec.args.includes('--bare'), `expected --bare in args: ${spec.args.join(' ')}`)
+    assert.ok(spec.args.includes('-p'), '`-p` (print) flag required for non-interactive use')
+    const fmtIdx = spec.args.indexOf('--output-format')
     assert.notEqual(fmtIdx, -1, '--output-format required for structured parsing')
-    assert.equal(plan.args[fmtIdx + 1], 'json')
+    assert.equal(spec.args[fmtIdx + 1], 'json')
   })
 
-  it('spawn plan injects ANTHROPIC_API_KEY into env', () => {
-    const plan = buildSpawnPlan(makeSpec(), 'sk-ant-fake-test-key')
-    const env = plan.options.env as Record<string, string>
-    assert.equal(env.ANTHROPIC_API_KEY, 'sk-ant-fake-test-key')
+  it('exec spec injects ANTHROPIC_API_KEY into env', () => {
+    const spec = buildExecSpec(makeSpec(), 'sk-ant-fake-test-key')
+    assert.equal(spec.env.ANTHROPIC_API_KEY, 'sk-ant-fake-test-key')
   })
 
-  it('spawn plan does NOT write any credential file path into args', () => {
-    const plan = buildSpawnPlan(makeSpec(), 'sk-ant-fake-test-key')
-    const joined = plan.args.join(' ')
+  it('exec spec does NOT write any credential file path into args', () => {
+    const spec = buildExecSpec(makeSpec(), 'sk-ant-fake-test-key')
+    const joined = spec.args.join(' ')
     assert.doesNotMatch(joined, /credentials\.json/)
     assert.doesNotMatch(joined, /\.claude\//)
   })
 
-  it('spawn env contains exactly the allowlist keys plus ANTHROPIC_API_KEY, no others (closes #8)', () => {
+  it('exec env contains exactly the allowlist keys plus ANTHROPIC_API_KEY, no others (closes #8)', () => {
     // Pollute process.env with a known-bad set covering every category from
     // issue #8: endpoint redirect, provider switch, model override, alt-auth,
-    // OAuth side-channel, 3P provider creds, NODE_OPTIONS, HTTP_PROXY, plus
-    // an arbitrary leak canary. None of these may appear in the spawn env.
+    // OAuth side-channel, 3P provider creds, NODE_OPTIONS, HTTP_PROXY,
+    // publish credentials (dispatcher-only per ADR-0004 / plan §4b-8), plus
+    // an arbitrary leak canary. None of these may appear in the exec env.
     const polluted = {
       FAKE_LEAK_VAR: 'leak',
       ANTHROPIC_BASE_URL: 'https://evil.example/',
@@ -125,6 +146,9 @@ describe('ClaudeCodeWorker — env injection (CI)', () => {
       CLAUDE_CODE_OAUTH_REFRESH_TOKEN: 'refresh',
       CLAUDE_CODE_SESSION_ACCESS_TOKEN: 'session',
       AWS_BEARER_TOKEN_BEDROCK: 'aws-bearer',
+      GH_TOKEN: 'gh-publish-cred',
+      GITHUB_TOKEN: 'gh-publish-cred-2',
+      SSH_AUTH_SOCK: '/tmp/agent.sock',
       NODE_OPTIONS: '--inspect=0.0.0.0:9229',
       HTTP_PROXY: 'http://attacker.example:8080',
       HTTPS_PROXY: 'http://attacker.example:8080',
@@ -141,7 +165,7 @@ describe('ClaudeCodeWorker — env injection (CI)', () => {
         assert.equal(
           env[k],
           undefined,
-          `${k} leaked into spawn env — allowlist breach`,
+          `${k} leaked into exec env — allowlist breach`,
         )
       }
       assert.equal(env.ANTHROPIC_API_KEY, 'sk-ant-fake-test-key')
@@ -153,7 +177,7 @@ describe('ClaudeCodeWorker — env injection (CI)', () => {
       for (const k of Object.keys(env)) {
         assert.ok(
           allowed.has(k),
-          `unexpected key in spawn env: ${k} (not in allowlist)`,
+          `unexpected key in exec env: ${k} (not in allowlist)`,
         )
       }
     } finally {
@@ -164,7 +188,7 @@ describe('ClaudeCodeWorker — env injection (CI)', () => {
     }
   })
 
-  it('spawn env passes through allowlist keys when defined in process.env', () => {
+  it('exec env passes through allowlist keys when defined in process.env', () => {
     const saved = {
       PATH: process.env.PATH,
       HOME: process.env.HOME,
@@ -186,7 +210,7 @@ describe('ClaudeCodeWorker — env injection (CI)', () => {
     }
   })
 
-  it('spawn env omits allowlist keys that are absent from process.env (no empty-string padding)', () => {
+  it('exec env omits allowlist keys that are absent from process.env (no empty-string padding)', () => {
     const saved = process.env.TZ
     delete process.env.TZ
     try {
@@ -200,13 +224,20 @@ describe('ClaudeCodeWorker — env injection (CI)', () => {
     }
   })
 
-  it('spawn plan does NOT detach the child (orphan-prevention)', () => {
-    const plan = buildSpawnPlan(makeSpec(), 'sk-ant-fake-test-key')
-    assert.notEqual(
-      plan.options.detached,
-      true,
-      'detached: true would orphan the worker if the daemon dies — keeps billing',
-    )
+  // The pre-ADR-0004 "does NOT detach" orphan-prevention test moved to the
+  // runtime suite: detachment is now the runtime's job, and its orphan-safety
+  // contract (proc.json + start-time-validated reaper) is tested there.
+  it('exec spec carries no placement detail (cwd only when workingDirectory set)', () => {
+    const bare = buildExecSpec(makeSpec(), 'sk-ant-fake-test-key')
+    assert.ok(!('cwd' in bare), 'cwd must be absent when workingDirectory is null — runtime supplies the workspace path')
+    const dir = buildExecSpec(makeSpec({ workingDirectory: '/tmp/ws' }), 'sk-ant-fake-test-key')
+    assert.equal(dir.cwd, '/tmp/ws')
+  })
+
+  it('unmanagedWorkspace is honestly marked (never reapable)', () => {
+    const ws = unmanagedWorkspace(makeSpec({ workingDirectory: '/tmp/somewhere' }))
+    assert.ok(ws.id.startsWith('unmanaged:'))
+    assert.equal(ws.path, '/tmp/somewhere')
   })
 
   it('resolveApiKey: WorkerContext.env override wins when non-empty', () => {
@@ -227,18 +258,16 @@ describe('ClaudeCodeWorker — env injection (CI)', () => {
 })
 
 describe('ClaudeCodeWorker — terminal-event mapping (CI, closes #17)', () => {
-  // The seam is constructor-injected spawnImpl; every test here builds a fake
-  // child that emits the stdout/exit-code shape under test, then drains the
-  // stream for the terminal event.
+  // The seam is the constructor-injected fake runtime; every test builds a
+  // fake handle that emits the stdout/exit-code shape under test, then drains
+  // the stream for the terminal event.
   const ctx: WorkerContext = { env: { ANTHROPIC_API_KEY: 'sk-ant-fake-test-key' } }
   const SAVED_KEY = process.env.ANTHROPIC_API_KEY
   process.env.ANTHROPIC_API_KEY = 'sk-ant-fake-test-key'
 
   it('exit 0 + parses + is_error: false → complete with result payload', async () => {
     const envelope = { type: 'result', subtype: 'success', is_error: false, result: 'OK' }
-    const worker = new ClaudeCodeWorker({
-      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
-    })
+    const worker = workerWith(fakeHandle({ stdout: JSON.stringify(envelope), exitCode: 0 }))
     const handle = await worker.start(makeSpec(), ctx)
     const ev = await drainTerminal(worker, handle)
     assert.equal(ev.kind, 'complete')
@@ -253,9 +282,7 @@ describe('ClaudeCodeWorker — terminal-event mapping (CI, closes #17)', () => {
       is_error: true,
       result: 'Rate limit exceeded: please retry after 60s',
     }
-    const worker = new ClaudeCodeWorker({
-      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
-    })
+    const worker = workerWith(fakeHandle({ stdout: JSON.stringify(envelope), exitCode: 0 }))
     const handle = await worker.start(makeSpec(), ctx)
     const ev = await drainTerminal(worker, handle)
     assert.equal(ev.kind, 'failed')
@@ -267,9 +294,7 @@ describe('ClaudeCodeWorker — terminal-event mapping (CI, closes #17)', () => {
 
   it('exit 0 + parses + is_error: true + NO error text → failed with synthetic reason', async () => {
     const envelope = { type: 'result', subtype: 'error_unknown', is_error: true }
-    const worker = new ClaudeCodeWorker({
-      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
-    })
+    const worker = workerWith(fakeHandle({ stdout: JSON.stringify(envelope), exitCode: 0 }))
     const handle = await worker.start(makeSpec(), ctx)
     const ev = await drainTerminal(worker, handle)
     assert.equal(ev.kind, 'failed')
@@ -281,9 +306,7 @@ describe('ClaudeCodeWorker — terminal-event mapping (CI, closes #17)', () => {
 
   it('exit 0 + parses but envelope has no boolean is_error → failed with synthetic reason', async () => {
     const malformed = { unexpected: 'shape', no_is_error_field: true }
-    const worker = new ClaudeCodeWorker({
-      spawnImpl: fakeSpawn({ stdout: JSON.stringify(malformed), exitCode: 0 }),
-    })
+    const worker = workerWith(fakeHandle({ stdout: JSON.stringify(malformed), exitCode: 0 }))
     const handle = await worker.start(makeSpec(), ctx)
     const ev = await drainTerminal(worker, handle)
     assert.equal(ev.kind, 'failed')
@@ -293,9 +316,7 @@ describe('ClaudeCodeWorker — terminal-event mapping (CI, closes #17)', () => {
   })
 
   it('exit 0 + unparseable stdout → failed with parse-error reason', async () => {
-    const worker = new ClaudeCodeWorker({
-      spawnImpl: fakeSpawn({ stdout: 'not json at all {{{', exitCode: 0 }),
-    })
+    const worker = workerWith(fakeHandle({ stdout: 'not json at all {{{', exitCode: 0 }))
     const handle = await worker.start(makeSpec(), ctx)
     const ev = await drainTerminal(worker, handle)
     assert.equal(ev.kind, 'failed')
@@ -304,15 +325,21 @@ describe('ClaudeCodeWorker — terminal-event mapping (CI, closes #17)', () => {
   })
 
   it('exit non-zero → failed (regression guard for existing behavior)', async () => {
-    const worker = new ClaudeCodeWorker({
-      spawnImpl: fakeSpawn({ stdout: '', stderr: 'boom', exitCode: 2 }),
-    })
+    const worker = workerWith(fakeHandle({ stdout: '', stderr: 'boom', exitCode: 2 }))
     const handle = await worker.start(makeSpec(), ctx)
     const ev = await drainTerminal(worker, handle)
     assert.equal(ev.kind, 'failed')
     const failed = ev as Extract<WorkerEvent, { kind: 'failed' }>
     assert.equal(failed.reason, 'boom')
     assert.equal(failed.recoverable, false)
+  })
+
+  it('signal-death with empty stderr → failed with killed-by-signal reason', async () => {
+    const worker = workerWith(fakeHandle({ stdout: '', exitCode: null as unknown as number, signal: 'SIGKILL' }))
+    const handle = await worker.start(makeSpec(), ctx)
+    const ev = await drainTerminal(worker, handle)
+    assert.equal(ev.kind, 'failed')
+    assert.match((ev as Extract<WorkerEvent, { kind: 'failed' }>).reason, /killed by SIGKILL/)
   })
 
   // Restore env state after the describe block runs.
@@ -322,63 +349,65 @@ describe('ClaudeCodeWorker — terminal-event mapping (CI, closes #17)', () => {
   })
 })
 
-describe('ClaudeCodeWorker — stop() lifecycle (CI, closes #14)', () => {
-  // Controllable fake child for stop() race coverage. Unlike the simple
-  // fakeChild() used by the parse-path tests above, this one:
-  //   - Defers 'close' until we drive it (so stop() races aren't pre-decided
-  //     by the simple fakeChild's setImmediate-close pattern).
-  //   - Records every kill() signal so tests can assert on what stop() sent.
-  //   - Decides per-signal whether to fire 'exit' / 'close', which is how we
-  //     model a child that ignores SIGTERM but cannot escape SIGKILL.
-  //   - Implementation uses child.kill(signal) (not process.kill(pid, signal))
-  //     so this fake intercepts cleanly — no live PIDs are signaled.
-  type Controllable = ChildProcess & {
-    signals: NodeJS.Signals[]
-    fireExit: (code: number, signal?: NodeJS.Signals | null) => void
+describe('ClaudeCodeWorker — stop() lifecycle (CI, closes #14, group semantics per #15/ADR-0004)', () => {
+  // Controllable fake handle for stop() race coverage. Unlike the simple
+  // fakeHandle() used by the parse-path tests above, this one:
+  //   - Defers wait() resolution until the test drives it via fireExit().
+  //   - Records every signal() call (name + group flag) so tests can assert
+  //     on what stop() sent.
+  //   - Decides per-signal whether to fire exit, which is how we model a
+  //     child that ignores SIGTERM but cannot escape SIGKILL.
+  type Controllable = ExecHandle & {
+    signals: string[]
+    groupFlags: boolean[]
+    fireExit: (code: number | null, signal?: string | null) => void
+    rejectWait: (err: Error) => void
   }
-  function controllableChild(opts: {
+  function controllableHandle(opts: {
     onSigterm?: 'exit' | 'ignore'
     pid?: number | null
   } = {}): Controllable {
     const onSigterm = opts.onSigterm ?? 'exit'
-    const c = new EventEmitter() as Controllable
-    // `pid: null` lets tests model the mid-spawn-no-pid case. Plain omission
-    // gets a default. Cannot use `?? 12345` because that would coerce null to
-    // the default.
-    c.pid = 'pid' in opts ? (opts.pid ?? undefined) : 12345
-    // Stdout/stderr exist but emit nothing (we don't care about parse paths
-    // here — stop() must terminate before the subprocess writes useful output).
-    c.stdout = new Readable({ read() {} }) as ChildProcess['stdout']
-    c.stderr = new Readable({ read() {} }) as ChildProcess['stderr']
-    c.exitCode = null
-    c.signalCode = null
-    c.killed = false
-    c.signals = []
-    c.kill = ((signal?: NodeJS.Signals | number) => {
-      const sig = (typeof signal === 'string' ? signal : 'SIGTERM') as NodeJS.Signals
-      c.signals.push(sig)
-      if (sig === 'SIGTERM' && onSigterm === 'exit') {
-        // Honor the term: fire exit on a microtask so the implementation's
-        // race-arming code has registered its listener first.
-        queueMicrotask(() => c.fireExit(143, 'SIGTERM'))
-      } else if (sig === 'SIGKILL') {
-        // SIGKILL is unblockable.
-        queueMicrotask(() => c.fireExit(137, 'SIGKILL'))
-      }
-      return true
-    }) as ChildProcess['kill']
-    c.fireExit = (code, signal) => {
-      c.exitCode = code
-      if (signal != null) c.signalCode = signal
-      c.killed = true
-      // Read the stdout/stderr we never populated to nudge the worker's
-      // accumulators closed before 'close' fires.
-      ;(c.stdout as Readable).push(null)
-      ;(c.stderr as Readable).push(null)
-      c.emit('exit', code, signal ?? null)
-      // Worker's `resolved` listens on 'close', not 'exit'. Fire both so the
-      // stream() drainer can proceed and assert on terminationMode.
-      queueMicrotask(() => c.emit('close', code, signal ?? null))
+    const pid = 'pid' in opts ? (opts.pid ?? null) : 12345
+    let resolveWait!: (e: ExecExit) => void
+    let rejectWait!: (err: Error) => void
+    const waitP = new Promise<ExecExit>((res, rej) => {
+      resolveWait = res
+      rejectWait = rej
+    })
+    const stdout = new Readable({ read() {} })
+    const stderr = new Readable({ read() {} })
+    const c: Controllable = {
+      pid,
+      pgid: pid,
+      stdout,
+      stderr,
+      wait: () => waitP,
+      signals: [],
+      groupFlags: [],
+      signal(sig, sopts) {
+        c.signals.push(sig)
+        c.groupFlags.push(sopts?.group === true)
+        if (sig === 'SIGTERM' && onSigterm === 'exit') {
+          // Honor the term: fire exit on a microtask so the implementation's
+          // race-arming code has registered its listener first.
+          queueMicrotask(() => c.fireExit(143, 'SIGTERM'))
+        } else if (sig === 'SIGKILL') {
+          // SIGKILL is unblockable.
+          queueMicrotask(() => c.fireExit(137, 'SIGKILL'))
+        }
+        return true
+      },
+      fireExit(code, signal) {
+        stdout.push(null)
+        stderr.push(null)
+        // Resolve on a microtask so the just-pushed stream EOFs flush into
+        // the worker's accumulators first (mirrors the runtime's drain).
+        queueMicrotask(() => resolveWait({ exitCode: code, signal: signal ?? null }))
+      },
+      rejectWait(err) {
+        rejectWait(err)
+      },
     }
     return c
   }
@@ -395,43 +424,51 @@ describe('ClaudeCodeWorker — stop() lifecycle (CI, closes #14)', () => {
   })
 
   it('stop() called twice → second call returns same promise, only one SIGTERM sent', async () => {
-    const child = controllableChild({ onSigterm: 'exit' })
-    const worker = new ClaudeCodeWorker({ spawnImpl: () => child })
+    const h = controllableHandle({ onSigterm: 'exit' })
+    const worker = workerWith(h)
     const handle = await worker.start(makeSpec(), ctx)
     const p1 = worker.stop(handle, 'first')
     const p2 = worker.stop(handle, 'second')
     assert.strictEqual(p1, p2, 'second stop() must return the same promise reference')
     await p1
-    assert.deepEqual(child.signals, ['SIGTERM'], 'only one SIGTERM sent for concurrent stop() calls')
+    assert.deepEqual(h.signals, ['SIGTERM'], 'only one SIGTERM sent for concurrent stop() calls')
+  })
+
+  it('stop() signals the GROUP from the first SIGTERM (ADR-0004 group-first escalation)', async () => {
+    const h = controllableHandle({ onSigterm: 'exit' })
+    const worker = workerWith(h)
+    const handle = await worker.start(makeSpec(), ctx)
+    await worker.stop(handle, 'graceful')
+    assert.deepEqual(h.groupFlags, [true], 'SIGTERM must target the process group, not just the leader')
   })
 
   it('stop() on a child that exits within grace → SIGTERM only, terminationMode=sigterm', async () => {
-    const child = controllableChild({ onSigterm: 'exit' })
-    const worker = new ClaudeCodeWorker({ spawnImpl: () => child })
+    const h = controllableHandle({ onSigterm: 'exit' })
+    const worker = workerWith(h)
     const handle = await worker.start(makeSpec(), ctx)
     await worker.stop(handle, 'graceful')
-    assert.deepEqual(child.signals, ['SIGTERM'], 'SIGKILL must not be sent when SIGTERM is honored')
+    assert.deepEqual(h.signals, ['SIGTERM'], 'SIGKILL must not be sent when SIGTERM is honored')
     const ev = await drainTerminal(worker, handle)
     assert.equal(ev.kind, 'failed')
     const failed = ev as Extract<WorkerEvent, { kind: 'failed' }>
     assert.equal(failed.terminationMode, 'sigterm')
   })
 
-  it('stop() on a child that ignores SIGTERM → SIGKILL after grace, terminationMode=sigkill', async () => {
+  it('stop() on a child that ignores SIGTERM → group SIGKILL after grace, terminationMode=sigkill', async () => {
     // Fake timers (apis: ['setTimeout'] only — leave setImmediate /
-    // queueMicrotask alone so the controllable child can still drive its
+    // queueMicrotask alone so the controllable handle can still drive its
     // exit emission). This is what keeps the SIGTERM-ignored test in the
     // millisecond range; a real 10s wait in CI is unacceptable.
     mock.timers.enable({ apis: ['setTimeout'] })
     try {
-      const child = controllableChild({ onSigterm: 'ignore' })
-      const worker = new ClaudeCodeWorker({ spawnImpl: () => child })
+      const h = controllableHandle({ onSigterm: 'ignore' })
+      const worker = workerWith(h)
       const handle = await worker.start(makeSpec(), ctx)
       const startedAt = Date.now()
       const stopPromise = worker.stop(handle, 'budget cap')
       // Let stop() send SIGTERM and arm its timer.
       await new Promise<void>((r) => setImmediate(r))
-      assert.deepEqual(child.signals, ['SIGTERM'], 'SIGTERM must be sent before grace elapses')
+      assert.deepEqual(h.signals, ['SIGTERM'], 'SIGTERM must be sent before grace elapses')
       // Advance virtual time past the grace window.
       mock.timers.tick(STOP_GRACE_MS + 100)
       await stopPromise
@@ -443,10 +480,11 @@ describe('ClaudeCodeWorker — stop() lifecycle (CI, closes #14)', () => {
         `stop() took ${Date.now() - startedAt}ms wall-clock; fake timers not in effect`,
       )
       assert.deepEqual(
-        child.signals,
+        h.signals,
         ['SIGTERM', 'SIGKILL'],
         'SIGKILL must be sent after grace when SIGTERM was ignored',
       )
+      assert.deepEqual(h.groupFlags, [true, true], 'both signals must target the group')
       const ev = await drainTerminal(worker, handle)
       assert.equal(ev.kind, 'failed')
       const failed = ev as Extract<WorkerEvent, { kind: 'failed' }>
@@ -457,44 +495,39 @@ describe('ClaudeCodeWorker — stop() lifecycle (CI, closes #14)', () => {
   })
 
   it('stop() called after stream() has already terminated naturally → resolves immediately, no signal sent', async () => {
-    // Use the simple fakeSpawn (which pre-buffers stdout via Readable.from) so
-    // the worker sees a clean exit-0 + valid envelope and reaches state
-    // 'complete' before stop() is called. The controllable child's manual
-    // push() pattern races against the close emit and is overkill here.
     const envelope = { type: 'result', subtype: 'success', is_error: false, result: 'OK' }
-    let killCount = 0
-    const spawnImpl: SpawnFn = () => {
-      const c = fakeChild({ stdout: JSON.stringify(envelope), exitCode: 0 })
-      c.kill = (() => {
-        killCount++
+    let signalCount = 0
+    const base = fakeHandle({ stdout: JSON.stringify(envelope), exitCode: 0 })
+    const h: ExecHandle = {
+      ...base,
+      signal: () => {
+        signalCount++
         return true
-      }) as ChildProcess['kill']
-      return c
+      },
     }
-    const worker = new ClaudeCodeWorker({ spawnImpl })
+    const worker = workerWith(h)
     const handle = await worker.start(makeSpec(), ctx)
     const ev = await drainTerminal(worker, handle)
     assert.equal(ev.kind, 'complete')
     // State is now 'complete'. stop() must take the fast path.
     await worker.stop(handle, 'too late')
-    assert.equal(killCount, 0, 'no signal should be sent after natural termination')
+    assert.equal(signalCount, 0, 'no signal should be sent after natural termination')
   })
 
   it('stop() called mid-spawn (no pid) → resolves once spawn settles, no error on spawn failure', async () => {
-    const child = controllableChild({ pid: null })
-    const worker = new ClaudeCodeWorker({ spawnImpl: () => child })
+    const h = controllableHandle({ pid: null })
+    const worker = workerWith(h)
     const handle = await worker.start(makeSpec(), ctx)
     const stopPromise = worker.stop(handle, 'never started')
     // Simulate spawn failure landing after stop() was called.
-    queueMicrotask(() => child.emit('error', new Error('spawn ENOENT')))
+    queueMicrotask(() => h.rejectWait(new Error('spawn ENOENT')))
     await stopPromise
     assert.deepEqual(
-      child.signals,
+      h.signals,
       [],
-      'no kill() should be issued when pid is unknown — wait for spawn to settle instead',
+      'no signal should be issued when pid is unknown — wait for spawn to settle instead',
     )
   })
-
 })
 
 describe('ClaudeCodeWorker — tokens event from usage block (CI, closes #13)', () => {
@@ -528,9 +561,7 @@ describe('ClaudeCodeWorker — tokens event from usage block (CI, closes #13)', 
       result: 'OK',
       usage: { input_tokens: 123, output_tokens: 45 },
     }
-    const worker = new ClaudeCodeWorker({
-      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
-    })
+    const worker = workerWith(fakeHandle({ stdout: JSON.stringify(envelope), exitCode: 0 }))
     const handle = await worker.start(makeSpec(), ctx)
     const events = await drainAll(worker, handle)
     const tokensIdx = events.findIndex((e) => e.kind === 'tokens')
@@ -561,9 +592,7 @@ describe('ClaudeCodeWorker — tokens event from usage block (CI, closes #13)', 
         cache_read_input_tokens: 1500,
       },
     }
-    const worker = new ClaudeCodeWorker({
-      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
-    })
+    const worker = workerWith(fakeHandle({ stdout: JSON.stringify(envelope), exitCode: 0 }))
     const handle = await worker.start(makeSpec(), ctx)
     const events = await drainAll(worker, handle)
     const tokens = events.find((e) => e.kind === 'tokens') as
@@ -578,9 +607,7 @@ describe('ClaudeCodeWorker — tokens event from usage block (CI, closes #13)', 
 
   it('envelope without usage block → no tokens event, complete still emitted, no error', async () => {
     const envelope = { type: 'result', subtype: 'success', is_error: false, result: 'OK' }
-    const worker = new ClaudeCodeWorker({
-      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
-    })
+    const worker = workerWith(fakeHandle({ stdout: JSON.stringify(envelope), exitCode: 0 }))
     const handle = await worker.start(makeSpec(), ctx)
     const events = await drainAll(worker, handle)
     assert.equal(
@@ -594,7 +621,7 @@ describe('ClaudeCodeWorker — tokens event from usage block (CI, closes #13)', 
       'missing usage is silent (degraded telemetry), not a warning',
     )
     const terminal = events[events.length - 1]
-    assert.equal(terminal.kind, 'complete')
+    assert.equal(terminal!.kind, 'complete')
   })
 
   it('envelope with usage as a non-object (string) → no tokens, warn log, complete still emitted', async () => {
@@ -605,9 +632,7 @@ describe('ClaudeCodeWorker — tokens event from usage block (CI, closes #13)', 
       result: 'OK',
       usage: 'not an object at all',
     }
-    const worker = new ClaudeCodeWorker({
-      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
-    })
+    const worker = workerWith(fakeHandle({ stdout: JSON.stringify(envelope), exitCode: 0 }))
     const handle = await worker.start(makeSpec(), ctx)
     const events = await drainAll(worker, handle)
     assert.equal(events.find((e) => e.kind === 'tokens'), undefined)
@@ -618,7 +643,7 @@ describe('ClaudeCodeWorker — tokens event from usage block (CI, closes #13)', 
     assert.equal(log.level, 'warn')
     assert.match(log.message, /usage block malformed/)
     const terminal = events[events.length - 1]
-    assert.equal(terminal.kind, 'complete')
+    assert.equal(terminal!.kind, 'complete')
   })
 
   it('envelope with non-numeric counts → no tokens, warn log, complete still emitted', async () => {
@@ -629,9 +654,7 @@ describe('ClaudeCodeWorker — tokens event from usage block (CI, closes #13)', 
       result: 'OK',
       usage: { input_tokens: 'lots', output_tokens: null },
     }
-    const worker = new ClaudeCodeWorker({
-      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
-    })
+    const worker = workerWith(fakeHandle({ stdout: JSON.stringify(envelope), exitCode: 0 }))
     const handle = await worker.start(makeSpec(), ctx)
     const events = await drainAll(worker, handle)
     assert.equal(events.find((e) => e.kind === 'tokens'), undefined)
@@ -642,13 +665,13 @@ describe('ClaudeCodeWorker — tokens event from usage block (CI, closes #13)', 
     assert.equal(log.level, 'warn')
     assert.match(log.message, /input_tokens\/output_tokens missing or non-numeric/)
     const terminal = events[events.length - 1]
-    assert.equal(terminal.kind, 'complete')
+    assert.equal(terminal!.kind, 'complete')
   })
 
   it('envelope with is_error: true (even if usage present) → no tokens event on the failed path', async () => {
     // Cheap version doesn't bill failed paths. The Claude Code envelope may
     // carry partial usage on failure; capturing that requires per-message
-    // tracking (stream-json), deferred to the p3 follow-up.
+    // tracking (stream-json), deferred to the p3 follow-up (#26).
     const envelope = {
       type: 'result',
       subtype: 'error_max_turns',
@@ -656,9 +679,7 @@ describe('ClaudeCodeWorker — tokens event from usage block (CI, closes #13)', 
       result: 'Rate limit exceeded',
       usage: { input_tokens: 999, output_tokens: 1 },
     }
-    const worker = new ClaudeCodeWorker({
-      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
-    })
+    const worker = workerWith(fakeHandle({ stdout: JSON.stringify(envelope), exitCode: 0 }))
     const handle = await worker.start(makeSpec(), ctx)
     const events = await drainAll(worker, handle)
     assert.equal(
@@ -667,54 +688,62 @@ describe('ClaudeCodeWorker — tokens event from usage block (CI, closes #13)', 
       'failed envelopes must not emit tokens in the cheap version',
     )
     const terminal = events[events.length - 1]
-    assert.equal(terminal.kind, 'failed')
+    assert.equal(terminal!.kind, 'failed')
   })
 })
 
 describe('ClaudeCodeWorker — heartbeats (CI, closes #11)', () => {
-  // Long-lived fake child for the multi-heartbeat tests: stdout/stderr stay
-  // open (push() never called with null) and no 'close' is ever emitted, so
-  // session.resolved never settles on its own. Cleanup is the test's
-  // responsibility — call iterator.return() or fire 'close' manually.
-  function neverCloseChild(opts: { pid?: number | null } = {}): ChildProcess {
-    const c = new EventEmitter() as ChildProcess
-    ;(c as { pid?: number }).pid = 'pid' in opts ? (opts.pid ?? undefined) : 12345
-    c.stdout = new Readable({ read() {} }) as ChildProcess['stdout']
-    c.stderr = new Readable({ read() {} }) as ChildProcess['stderr']
-    c.exitCode = null
-    c.signalCode = null
-    c.killed = false
-    return c
+  // Long-lived fake handle for the multi-heartbeat tests: stdout/stderr stay
+  // open and wait() never settles, so session.resolved never settles on its
+  // own. Cleanup is the test's responsibility — call iterator.return() or
+  // drive fireExit() manually.
+  type Controllable = ExecHandle & {
+    signals: string[]
+    fireExit: (code: number | null, signal?: string | null) => void
+    rejectWait: (err: Error) => void
+    pushStdout: (chunk: string) => void
   }
-
-  // Controllable variant for the stop()-mid-stream test: records signals,
-  // honors SIGKILL, and can be driven to exit manually via fireExit().
-  type Controllable = ChildProcess & {
-    signals: NodeJS.Signals[]
-    fireExit: (code: number, signal?: NodeJS.Signals | null) => void
-  }
-  function controllableChild(opts: { onSigterm?: 'exit' | 'ignore' } = {}): Controllable {
+  function controllableHandle(opts: {
+    onSigterm?: 'exit' | 'ignore'
+    pid?: number | null
+  } = {}): Controllable {
     const onSigterm = opts.onSigterm ?? 'ignore'
-    const c = neverCloseChild() as Controllable
-    c.signals = []
-    c.kill = ((signal?: NodeJS.Signals | number) => {
-      const sig = (typeof signal === 'string' ? signal : 'SIGTERM') as NodeJS.Signals
-      c.signals.push(sig)
-      if (sig === 'SIGTERM' && onSigterm === 'exit') {
-        queueMicrotask(() => c.fireExit(143, 'SIGTERM'))
-      } else if (sig === 'SIGKILL') {
-        queueMicrotask(() => c.fireExit(137, 'SIGKILL'))
-      }
-      return true
-    }) as ChildProcess['kill']
-    c.fireExit = (code, signal) => {
-      c.exitCode = code
-      if (signal != null) c.signalCode = signal
-      c.killed = true
-      ;(c.stdout as Readable).push(null)
-      ;(c.stderr as Readable).push(null)
-      c.emit('exit', code, signal ?? null)
-      queueMicrotask(() => c.emit('close', code, signal ?? null))
+    const pid = 'pid' in opts ? (opts.pid ?? null) : 12345
+    let resolveWait!: (e: ExecExit) => void
+    let rejectWaitFn!: (err: Error) => void
+    const waitP = new Promise<ExecExit>((res, rej) => {
+      resolveWait = res
+      rejectWaitFn = rej
+    })
+    const stdout = new Readable({ read() {} })
+    const stderr = new Readable({ read() {} })
+    const c: Controllable = {
+      pid,
+      pgid: pid,
+      stdout,
+      stderr,
+      wait: () => waitP,
+      signals: [],
+      signal(sig) {
+        c.signals.push(sig)
+        if (sig === 'SIGTERM' && onSigterm === 'exit') {
+          queueMicrotask(() => c.fireExit(143, 'SIGTERM'))
+        } else if (sig === 'SIGKILL') {
+          queueMicrotask(() => c.fireExit(137, 'SIGKILL'))
+        }
+        return true
+      },
+      fireExit(code, signal) {
+        stdout.push(null)
+        stderr.push(null)
+        queueMicrotask(() => resolveWait({ exitCode: code, signal: signal ?? null }))
+      },
+      rejectWait(err) {
+        rejectWaitFn(err)
+      },
+      pushStdout(chunk) {
+        stdout.push(chunk)
+      },
     }
     return c
   }
@@ -737,8 +766,8 @@ describe('ClaudeCodeWorker — heartbeats (CI, closes #11)', () => {
     // increasing" assertion would be untestable.
     mock.timers.enable({ apis: ['setTimeout', 'Date'] })
     try {
-      const child = neverCloseChild()
-      const worker = new ClaudeCodeWorker({ spawnImpl: () => child })
+      const h = controllableHandle()
+      const worker = workerWith(h)
       const handle = await worker.start(makeSpec(), ctx)
       const iter = worker.stream(handle)[Symbol.asyncIterator]()
 
@@ -782,9 +811,7 @@ describe('ClaudeCodeWorker — heartbeats (CI, closes #11)', () => {
       result: 'OK',
       usage: { input_tokens: 5, output_tokens: 7 },
     }
-    const worker = new ClaudeCodeWorker({
-      spawnImpl: fakeSpawn({ stdout: JSON.stringify(envelope), exitCode: 0 }),
-    })
+    const worker = workerWith(fakeHandle({ stdout: JSON.stringify(envelope), exitCode: 0 }))
     const handle = await worker.start(makeSpec(), ctx)
     const events: WorkerEvent[] = []
     for await (const ev of worker.stream(handle)) {
@@ -798,19 +825,19 @@ describe('ClaudeCodeWorker — heartbeats (CI, closes #11)', () => {
     )
     // Sanity: tokens + complete still landed.
     assert.ok(events.find((e) => e.kind === 'tokens'))
-    assert.equal(events[events.length - 1].kind, 'complete')
+    assert.equal(events[events.length - 1]!.kind, 'complete')
   })
 
   it('debounce: natural event resets the heartbeat timer; original would-have-fired tick does NOT emit', async () => {
     // Pins the reset-on-every-yield invariant inside enqueue(): advance to
     // 1ms before the initial heartbeat would fire (no heartbeat yet), then
-    // route natural events through enqueue() via a child close (tokens +
+    // route natural events through enqueue() via child exit (tokens +
     // complete), then advance past the original deadline. The original
     // timer was cleared by the first enqueue, so no heartbeat must land.
     mock.timers.enable({ apis: ['setTimeout', 'Date'] })
     try {
-      const child = controllableChild({ onSigterm: 'ignore' })
-      const worker = new ClaudeCodeWorker({ spawnImpl: () => child })
+      const h = controllableHandle({ onSigterm: 'ignore' })
+      const worker = workerWith(h)
       const handle = await worker.start(makeSpec(), ctx)
 
       const events: WorkerEvent[] = []
@@ -833,7 +860,7 @@ describe('ClaudeCodeWorker — heartbeats (CI, closes #11)', () => {
         'no heartbeat may fire 1ms before HEARTBEAT_INTERVAL_MS',
       )
 
-      // Yield natural events via close. driveCompletion enqueues tokens then
+      // Yield natural events via exit. driveCompletion enqueues tokens then
       // complete; each enqueue() clears the pending heartbeat timer.
       const envelope = {
         type: 'result',
@@ -842,9 +869,9 @@ describe('ClaudeCodeWorker — heartbeats (CI, closes #11)', () => {
         result: 'OK',
         usage: { input_tokens: 1, output_tokens: 1 },
       }
-      ;(child.stdout as Readable).push(JSON.stringify(envelope))
+      h.pushStdout(JSON.stringify(envelope))
       await new Promise<void>((r) => setImmediate(r))
-      child.fireExit(0, null)
+      h.fireExit(0, null)
       await new Promise<void>((r) => setImmediate(r))
       await new Promise<void>((r) => setImmediate(r))
 
@@ -859,7 +886,7 @@ describe('ClaudeCodeWorker — heartbeats (CI, closes #11)', () => {
         0,
         'natural events must reset the heartbeat timer; the original deadline must NOT emit',
       )
-      assert.equal(events[events.length - 1].kind, 'complete')
+      assert.equal(events[events.length - 1]!.kind, 'complete')
     } finally {
       mock.timers.reset()
     }
@@ -868,8 +895,8 @@ describe('ClaudeCodeWorker — heartbeats (CI, closes #11)', () => {
   it('stop() mid-stream → no heartbeats emitted between SIGTERM and exit', async () => {
     mock.timers.enable({ apis: ['setTimeout', 'Date'] })
     try {
-      const child = controllableChild({ onSigterm: 'ignore' })
-      const worker = new ClaudeCodeWorker({ spawnImpl: () => child })
+      const h = controllableHandle({ onSigterm: 'ignore' })
+      const worker = workerWith(h)
       const handle = await worker.start(makeSpec(), ctx)
 
       const events: WorkerEvent[] = []
@@ -884,8 +911,8 @@ describe('ClaudeCodeWorker — heartbeats (CI, closes #11)', () => {
       // the wait-for-event state.
       await new Promise<void>((r) => setImmediate(r))
 
-      // Drive stop(): SIGTERM, state → 'cancelled', grace timer armed for 10s,
-      // SIGKILL after STOP_GRACE_MS, child fires exit/close, driveCompletion
+      // Drive stop(): group SIGTERM, state → 'cancelled', grace timer armed,
+      // group SIGKILL after STOP_GRACE_MS, handle resolves, driveCompletion
       // enqueues failed terminal. Advance well past both the grace window AND
       // multiple HEARTBEAT_INTERVAL_MS so any leaked heartbeat tick would fire.
       const stopPromise = worker.stop(handle, 'mid-stream cancel')
@@ -899,7 +926,7 @@ describe('ClaudeCodeWorker — heartbeats (CI, closes #11)', () => {
         0,
         'no heartbeats may be emitted between SIGTERM and exit — state was cancelled, tick must skip',
       )
-      const terminal = events[events.length - 1]
+      const terminal = events[events.length - 1]!
       assert.equal(terminal.kind, 'failed')
       assert.equal(
         (terminal as Extract<WorkerEvent, { kind: 'failed' }>).terminationMode,
@@ -914,11 +941,11 @@ describe('ClaudeCodeWorker — heartbeats (CI, closes #11)', () => {
   it('spawn error before child PID known → heartbeat timer cleared, no leak', async () => {
     mock.timers.enable({ apis: ['setTimeout', 'Date'] })
     try {
-      const child = neverCloseChild({ pid: null })
-      const worker = new ClaudeCodeWorker({ spawnImpl: () => child })
+      const h = controllableHandle({ pid: null })
+      const worker = workerWith(h)
       const handle = await worker.start(makeSpec(), ctx)
       // Simulate spawn failure landing right after start() returns.
-      queueMicrotask(() => child.emit('error', new Error('spawn ENOENT')))
+      queueMicrotask(() => h.rejectWait(new Error('spawn ENOENT')))
 
       const events: WorkerEvent[] = []
       for await (const ev of worker.stream(handle)) {
@@ -927,14 +954,12 @@ describe('ClaudeCodeWorker — heartbeats (CI, closes #11)', () => {
       }
       // Generator has returned; its finally cleared the timer. Advance virtual
       // time well past HEARTBEAT_INTERVAL_MS — if the timer were leaking, it
-      // would tick now (and we'd see a heartbeat appended... except the
-      // generator is closed, so the symptom would be a stray scheduled
-      // callback). Cleanest assertion: events array unchanged after tick.
+      // would tick now. Cleanest assertion: events array unchanged after tick.
       const sizeBeforeTick = events.length
       mock.timers.tick(HEARTBEAT_INTERVAL_MS * 3)
       assert.equal(events.length, sizeBeforeTick, 'no late heartbeats after generator return')
       assert.equal(events.length, 1)
-      assert.equal(events[0].kind, 'failed')
+      assert.equal(events[0]!.kind, 'failed')
       assert.equal(
         events.filter((e) => e.kind === 'heartbeat').length,
         0,
@@ -1027,9 +1052,9 @@ describe('ClaudeCodeWorker — lastEventAt updates at every WorkerEvent yield si
 
   for (const c of cases) {
     it(`updates lastEventAt before yielding — ${c.name}`, async () => {
-      const worker = new ClaudeCodeWorker({
-        spawnImpl: fakeSpawn({ stdout: c.stdout, stderr: c.stderr ?? '', exitCode: c.exitCode }),
-      })
+      const worker = workerWith(
+        fakeHandle({ stdout: c.stdout, stderr: c.stderr ?? '', exitCode: c.exitCode }),
+      )
       const handle = await worker.start(makeSpec(), ctx)
       const observed: WorkerEvent['kind'][] = []
       for await (const ev of worker.stream(handle)) {
@@ -1047,17 +1072,21 @@ describe('ClaudeCodeWorker — lastEventAt updates at every WorkerEvent yield si
   }
 
   it('updates lastEventAt before yielding — heartbeat', async () => {
-    // Heartbeat doesn't fit the fakeSpawn pattern above (closes immediately,
-    // never quiet long enough for the heartbeat timer to fire). Use a child
-    // that never closes plus mock.timers to fire one heartbeat, then assert
-    // session.lastEventAt matches the heartbeat's at.
+    // Heartbeat doesn't fit the fakeHandle pattern above (resolves
+    // immediately, never quiet long enough for the heartbeat timer to fire).
+    // Use a handle whose wait() never settles plus mock.timers to fire one
+    // heartbeat, then assert session.lastEventAt matches the heartbeat's at.
     mock.timers.enable({ apis: ['setTimeout', 'Date'] })
     try {
-      const child = new EventEmitter() as ChildProcess
-      ;(child as { pid?: number }).pid = 12345
-      child.stdout = new Readable({ read() {} }) as ChildProcess['stdout']
-      child.stderr = new Readable({ read() {} }) as ChildProcess['stderr']
-      const worker = new ClaudeCodeWorker({ spawnImpl: () => child })
+      const h: ExecHandle = {
+        pid: 12345,
+        pgid: 12345,
+        stdout: new Readable({ read() {} }),
+        stderr: new Readable({ read() {} }),
+        wait: () => new Promise<ExecExit>(() => {}),
+        signal: () => true,
+      }
+      const worker = workerWith(h)
       const handle = await worker.start(makeSpec(), ctx)
       const iter = worker.stream(handle)[Symbol.asyncIterator]()
 
@@ -1090,24 +1119,26 @@ const INTEGRATION_SKIP_REASON = !RUN_INTEGRATION
     : false
 
 describe('ClaudeCodeWorker — real subprocess (integration)', { skip: INTEGRATION_SKIP_REASON }, () => {
-  it('happy path: spawns claude -p --bare and returns parsed JSON result', async () => {
-    const worker = new ClaudeCodeWorker()
+  it('happy path: spawns claude -p --bare via GitWorktreeRuntime and returns parsed JSON result', async () => {
+    // Production wiring, production allowlist (DX F4): a real
+    // GitWorktreeRuntime, unmanaged workspace (cwd), real `claude` binary.
+    const worker = new ClaudeCodeWorker({ runtime: new GitWorktreeRuntime() })
     const ctx: WorkerContext = { env: { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY! } }
     const handle = await worker.start(makeSpec(), ctx)
-    let terminal: { kind: string; reason?: string; result?: unknown } | null = null
+    let terminal: WorkerEvent | null = null
     for await (const event of worker.stream(handle)) {
       if (event.kind === 'complete' || event.kind === 'failed') {
-        terminal = event as typeof terminal
+        terminal = event
         break
       }
     }
     assert.ok(terminal, 'stream must produce a terminal event')
     assert.equal(
-      terminal!.kind,
+      terminal.kind,
       'complete',
       `expected complete, got failed: ${(terminal as { reason?: string }).reason}`
     )
-    const result = (terminal as { result: { is_error?: boolean } }).result
+    const result = (terminal as unknown as { result: { is_error?: boolean } }).result
     assert.equal(typeof result, 'object')
     assert.equal(result.is_error, false, 'claude reported an API error; key invalid or quota hit?')
   })

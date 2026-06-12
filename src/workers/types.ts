@@ -12,8 +12,14 @@ export type TaskSpec = {
   workingDirectory: string | null
 }
 
+import type { WorkspaceHandle } from '../runtime/types.ts'
+
 export type WorkerContext = {
   env: Record<string, string>
+  // Additive (ADR-0004): the runtime-provisioned workspace, supplied by the
+  // dispatcher when a WorkerRuntime is in play. Optional so protocol-level
+  // tests and unmanaged runs (cwd from TaskSpec.workingDirectory) stay valid.
+  workspace?: WorkspaceHandle
 }
 
 export type SessionHandle = string
