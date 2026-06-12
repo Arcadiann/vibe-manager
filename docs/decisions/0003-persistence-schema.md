@@ -1,6 +1,6 @@
 # ADR-0003: Persistence Schema — `tasks`, `task_dependencies`, `memory`, `events`
 
-- Status: Proposed (operator review pending)
+- Status: Proposed (operator review pending; amended 2026-06-11 — see §Amendments. Gates #33, #41–#47 resolved or migration-bound below; #34/#36/#37 remain parked, so the ADR stays Proposed.)
 - Date: 2026-05-17
 - Supersedes: —
 
@@ -194,6 +194,36 @@ Not goals of this ADR; future decisions required:
 - **RLS policies.** This ADR does not turn on row-level security or write any policies. v1 is single-tenant on a trusted Supabase project; RLS becomes relevant at Version C and gets its own ADR.
 - **Multi-tenancy (Version C SaaS).** No `tenant_id` columns; no per-tenant key/encryption story. Additive when Version C lands.
 - **Operator dashboard query patterns.** Indexes here are sized for the orchestrator's reads, not for ad-hoc operator analytics. Additional indexes may be warranted once operator query patterns settle.
+
+## Amendments — 2026-06-11 (plan checkpoint #50)
+
+Gate decisions from the re-pour run's step-1 review. Items marked *(migration-bound)* are decided here but their issues close when the step-2 migration PR lands the SQL; doc-only items close with this amendment.
+
+### Resolved by this amendment
+
+- **#33 — embedding model, formal record.** Stay with `text-embedding-3-large` at 3072-dim `halfvec`. Rationale: highest-recall OpenAI-family model; `halfvec` halves storage and is HNSW-ready at 3072 dims on pgvector ≥ 0.7 (which the migration asserts); the `embedding_model` column already provides the re-embed migration path. Re-evaluation triggers, named: embedding spend becomes visible in dogfood data; row count approaches ~1M; a self-hosting requirement appears. Alternatives considered are recorded in #33 itself.
+  **Operational dependency, previously unstated:** this commits an otherwise all-Anthropic stack to a second vendor when the memory pipeline lands (M4b) — an OpenAI API key in the daemon environment (never in the worker env allowlist), a second billing surface *outside* the Anthropic $500 console cap, and operator-owned key rotation. No key is needed until M4b ships an embedder; the migration creates the column, not the dependency.
+- **#43 — `status_reason` semantics.** `status_reason` is the *current* reason only, overwritten on every transition. For transition history, query `events` filtered by `task_id` and `kind = 'task_status_change'`.
+- **#44 — `task_spec` audit guarantee.** Option (a): the rendered worker prompt is stored verbatim in `task_spec` (`task_spec.renderedPrompt`) at dispatch time. "What was sent to the worker" is reproducible from the row alone, independent of prompt-rendering code drift; the jsonb size cost is accepted at v1 volume.
+- **#45 — `memory.event_id` provenance is soft by design.** Events retention nulls it (`ON DELETE SET NULL`); the memory row is the durable artifact, the event was the trigger. Intentional, now stated.
+- **#46 — `memory.last_used_at` write-amplification.** Known scaling concern, added to Consequences: every retrieval is a SELECT + UPDATE. Fine at v1 volume; batch or defer the write-back when retrieval QPS warrants.
+- **WAN write-failure posture** (review F9). v1 accepts remote Supabase over WAN from an unattended laptop. Dispatcher policy: bounded retry (3×, backoff) on write failure, then **fail the affected task loudly** — events are never silently dropped and the daemon never limps past a persistence error. Connection mode must be session/direct (port 5432): session-scoped server state and LISTEN/NOTIFY do not survive Supavisor transaction pooling. The pool installs an idle-client error handler (a Supabase maintenance restart must not crash the daemon). Local-Postgres re-platforming was considered and rejected — the operator's constraint locks Supabase, and the schema is identical either way.
+- **Secrets at rest** (review F21). `task_spec.renderedPrompt` and event payloads persist verbatim to a WAN-hosted database with RLS disabled (#47). Accepted for v1 (single tenant, founder-owned repos, single connection string); named here beside the OpenAI-key note so it is a decision. The RLS ADR (deferred) revisits at Version C.
+
+### Migration-bound decisions (recorded now; issues close with the step-2 migration PR)
+
+- **#41 — `tokens_spent_cents` type.** Option (a): `numeric(20,8)` fractional cents. Lossless at Anthropic's ~0.0003-cents-per-token granularity; raw token counts remain in `events` for recomputation against future pricing tables.
+- **#42 — `idempotency_key text UNIQUE` (nullable) on `tasks`.** Cheap now, painful to retrofit. This — not session-scoped advisory locks, which Supavisor renders meaningless — is the restart/concurrent-run dedup primitive.
+- **#35 — append-only enforcement.** Database-level guard now: a `BEFORE UPDATE OR DELETE` trigger on `events` raising an exception. Carve-out mechanics matter: `SECURITY DEFINER` does **not** bypass triggers, so the trigger checks a GUC (`current_setting('vibe_manager.allow_prune', true)`) and `prune_events(retention interval)` does `SET LOCAL vibe_manager.allow_prune = 'on'` inside its transaction. Migration tests assert the trio: UPDATE blocked, raw DELETE blocked, prune succeeds. No scheduled prune job ships in this run (see parked #34).
+- **#47 — RLS.** The migration explicitly disables row-level security on all four tables, with a comment pointing at the deferred RLS ADR. (Supabase tooling enables RLS by default; without this, service-role queries fail with opaque permission errors on first deploy.)
+- **New: `events.dedupe_key uuid UNIQUE`** (client-minted). Writes use `ON CONFLICT DO NOTHING`, and `tokens_spent_cents` is derived idempotently in the same transaction as the event insert — a retried ambiguous write (WAN timeout that actually committed) can neither duplicate the audit log nor double-count spend.
+- **Migration tooling** (was an explicit non-goal of this ADR; small decision recorded): plain SQL files in `supabase/migrations/`, applied with the Supabase CLI; a paired `_down.sql` ships with each migration. No ORM — the orchestrator uses `pg` with hand-written parameterized SQL; the ORM question stays a deferred ADR. Migration 0001 opens with a `DO` block asserting pgvector ≥ 0.7 with a human-readable error.
+
+### Still parked (genuinely need a running orchestrator; NOT resolved — ADR stays Proposed)
+
+- **#34 — events retention default.** Needs observed event volume from real runs; `prune_events()` is parameterized and unscheduled; 90 days remains the documented provisional figure.
+- **#36 — post-task memory summarizer timing.** No summarizer exists until M4b; the sync-vs-deferred answer depends on whether the Manager's next task consumes the prior task's memory, unobservable until decomposition runs for real.
+- **#37 — soft-delete / forget-task path.** Version C compliance question; nothing in the migration forecloses adding `deleted_at` later. Hard-delete-with-documented-cascades stays the v1 default.
 
 ## References
 
