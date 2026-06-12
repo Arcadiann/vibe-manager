@@ -1,6 +1,6 @@
 # ADR-0004: Decouple Worker Runtime from Conductor — the `WorkerRuntime` Interface
 
-- Status: Proposed (operator checkpoint pending — issue #50)
+- Status: Accepted (2026-06-12 — operator approved checkpoint #50 "proceed as recommended"; implemented in PRs #53/#55)
 - Date: 2026-06-11
 - Supersedes: the "Worker tier (v1): Wrap Claude Code via Conductor worktrees" row of `docs/vision.md`'s locked-scope table (file edit deferred, same pattern as ADR-0002's supersession of the billing row; tracked with #31-class cleanup)
 
