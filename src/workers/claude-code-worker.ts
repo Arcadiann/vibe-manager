@@ -187,7 +187,13 @@ export function extractTokensEvent(usage: unknown, at: number): UsageExtractResu
 export function buildExecSpec(spec: TaskSpec, apiKey: string): ExecSpec {
   const out: ExecSpec = {
     command: 'claude',
-    args: ['-p', '--bare', '--output-format', 'json', spec.description],
+    // --dangerously-skip-permissions: headless `claude -p` cannot answer
+    // permission prompts, so without it every Write/Edit/Bash tool call is
+    // denied and the worker "completes" having changed nothing (smoke run
+    // #56 found this the expensive way). The isolation boundary is the
+    // runtime worktree + the env allowlist (ADR-0004), not per-tool prompts;
+    // finer-grained tool policy is a future worker option.
+    args: ['-p', '--bare', '--dangerously-skip-permissions', '--output-format', 'json', spec.description],
     env: buildSpawnEnv(apiKey),
   }
   if (spec.workingDirectory != null) out.cwd = spec.workingDirectory

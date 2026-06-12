@@ -73,6 +73,10 @@ describe('GitWorktreeRuntime — workspace lifecycle', () => {
     assert.equal(meta.baseRepoPath, fixtureRepo)
     const head = (await gitIn(ws.path, 'rev-parse', '--abbrev-ref', 'HEAD')).trim()
     assert.equal(head, 'vibe/task-roundtrip-a0')
+    // Runtime metadata must be invisible to git — a worker's `git add -A`
+    // swept .vibe/ into a PR once (smoke run #56).
+    const status = await gitIn(ws.path, 'status', '--porcelain')
+    assert.ok(!status.includes('.vibe'), `.vibe/ must be excluded from git status, got: ${status}`)
     await runtime.teardown(ws)
   })
 

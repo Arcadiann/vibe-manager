@@ -98,7 +98,14 @@ export async function runRoot(deps: DispatcherDeps, opts: RunOptions): Promise<R
   // llm_output_invalid) must not strand the root row in 'pending' (P2-5).
   let decomposition, order
   try {
-    ;({ decomposition, order } = await deps.manager.decompose(opts.prompt, opts.repoPath))
+    // Repo context is the NAME only — never the absolute path. Smoke run #56
+    // attempt 2: the Manager embedded the path in a task description and the
+    // worker wrote to the ORIGINAL clone instead of its isolated worktree.
+    const repoName = opts.repoPath.replace(/\/+$/, '').split('/').pop() ?? 'repository'
+    ;({ decomposition, order } = await deps.manager.decompose(
+      opts.prompt,
+      `a git repository named "${repoName}". Each worker runs inside its own isolated checkout of it (the worker's current working directory); task descriptions must refer to files by repository-relative path only — never absolute paths.`,
+    ))
   } catch (err) {
     await deps.tasks.setStatus(root.id, 'failed', { reason: String(err) })
     await deps.events.append({ kind: 'run_completed', taskId: root.id, rootTaskId: root.id, payloadSummary: `failed: ${String(err).slice(0, 160)}` })
@@ -215,6 +222,11 @@ export async function runRoot(deps: DispatcherDeps, opts: RunOptions): Promise<R
         payloadSummary: `push/PR failed: ${String(err).slice(0, 200)}`,
       })
       await deps.tasks.setStatus(root.id, 'failed', { reason: `push/PR failed: ${String(err)}` })
+      // Don't leak the completed workspaces on this early return — preserve
+      // them: their branches hold committed work that may not have pushed.
+      for (const cws of completedWorkspaces) {
+        try { await deps.runtime.teardown(cws, { preserve: true }) } catch { /* reap later */ }
+      }
       await deps.events.append({ kind: 'run_completed', taskId: root.id, rootTaskId: root.id, payloadSummary: 'failed' })
       return { rootTaskId: root.id, status: 'failed', prUrl, taskSummaries: results.map((r) => ({ id: r.id, title: r.title, status: r.status, summary: r.resultSummary })) }
     }
@@ -285,9 +297,10 @@ async function executeTask(
 
   // The rendered worker prompt is frozen verbatim into task_spec (#44).
   const description = [
+    'You are working in an isolated git worktree of the target repository — it is your current working directory. Refer to all files by RELATIVE path from the CWD. Never use absolute paths and never touch other checkouts of this repository, even if a path appears in the task text.\n\n',
     row.description,
     row.success_criteria ? `\nSuccess criteria: ${row.success_criteria}` : '',
-    '\nWhen you are done, stage and commit ALL of your changes with a descriptive message (git add -A && git commit). Do not push.',
+    '\nWhen you are done, stage and commit ALL of your changes in the current working directory with a descriptive message (git add -A && git commit). Do not push.',
   ].join('')
   const spec: TaskSpec = {
     taskId: row.id,
@@ -450,6 +463,24 @@ async function executeTask(
 
   // Map outcome to the task state machine per ADR-0001's error-semantics
   // table: dispatcher-initiated stops rewrite the worker's terminal.
+  // A "complete" coding task that committed NOTHING is a failure, not a
+  // success — the smoke run's first attempt had workers complete cleanly
+  // while writing zero files, and the empty branches only failed later at
+  // gh pr create, far from the cause. Validate structurally here.
+  let committedNothing = false
+  if (term.kind === 'complete' && stopReason === null) {
+    try {
+      const { stdout } = await execFileAsync(
+        'git',
+        ['rev-list', '--count', 'HEAD', `^${taskBaseRef}`],
+        { cwd: ws.path },
+      )
+      committedNothing = Number(stdout.trim()) === 0
+    } catch {
+      // Unmanaged/odd workspace — skip the guard rather than false-fail.
+    }
+  }
+
   let finalStatus: 'complete' | 'failed' | 'timed_out'
   let reason: string | null = null
   if (stopReason === 'timeout') {
@@ -461,6 +492,9 @@ async function executeTask(
   } else if (budgetExceeded) {
     finalStatus = 'failed'
     reason = `budget_exceeded: spent ${spentCents.toFixed(4)}¢ > cap ${budgetCents}¢ (low-fidelity post-hoc check; mid-run enforcement is #26)`
+  } else if (term.kind === 'complete' && committedNothing) {
+    finalStatus = 'failed'
+    reason = 'no_changes_committed: worker reported complete but its branch has zero commits over its base'
   } else if (term.kind === 'complete') {
     finalStatus = 'complete'
   } else {

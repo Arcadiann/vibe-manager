@@ -8,11 +8,17 @@ import pg from 'pg'
 //   idle-client errors that would otherwise CRASH the daemon — which, with
 //   detached workers, means unsupervised spend until human return.
 export function createPool(connectionString: string): pg.Pool {
+  // Supabase connections must be TLS. Their poolers present certs from
+  // Supabase's own CA, which Node's default trust store rejects — encrypt
+  // without chain verification for v1 (single operator, known host; full CA
+  // pinning is cheap to add when the cert is downloaded from the dashboard).
+  const isSupabase = /supabase\.(co|com)/.test(connectionString)
   const pool = new pg.Pool({
     connectionString,
     max: 5,
     keepAlive: true,
     options: '-c search_path=vibe_manager,public,extensions',
+    ...(isSupabase ? { ssl: { rejectUnauthorized: false } } : {}),
   })
   pool.on('error', (err) => {
     // Idle client dropped (server restart, WAN blip). Loud, never fatal —

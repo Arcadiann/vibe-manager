@@ -110,6 +110,10 @@ describe('ClaudeCodeWorker — env injection (CI)', () => {
     assert.equal(spec.command, 'claude')
     assert.ok(spec.args.includes('--bare'), `expected --bare in args: ${spec.args.join(' ')}`)
     assert.ok(spec.args.includes('-p'), '`-p` (print) flag required for non-interactive use')
+    assert.ok(
+      spec.args.includes('--dangerously-skip-permissions'),
+      'headless workers cannot answer permission prompts — without this flag every file edit is denied (smoke run #56)',
+    )
     const fmtIdx = spec.args.indexOf('--output-format')
     assert.notEqual(fmtIdx, -1, '--output-format required for structured parsing')
     assert.equal(spec.args[fmtIdx + 1], 'json')
