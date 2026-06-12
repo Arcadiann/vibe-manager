@@ -1,6 +1,6 @@
 # ADR-0001: WorkerAgent Interface Contract
 
-- Status: Proposed
+- Status: Accepted (2026-06-11 — two merged workers' worth of PRs conform to this contract; resolves #30. Drift issues #10, #16, #22 reconciled in the same pass.)
 - Date: 2026-05-16
 - Supersedes: —
 
@@ -18,7 +18,7 @@ The vision brief sketches the shape; this ADR makes it concrete enough to implem
 
 ## Decision
 
-The `WorkerAgent` interface has five methods and one capability struct. All methods are async. All return values are serializable so the contract survives a future move out-of-process.
+The `WorkerAgent` interface has five methods and one capability struct. Methods that perform I/O are async; `capabilities()` is synchronous and static (see below; resolves #10). All return values are serializable so the contract survives a future move out-of-process.
 
 ### Capability discovery (synchronous self-description)
 
@@ -57,6 +57,8 @@ type TaskSpec = {
 
 type WorkerContext = {
   env: Record<string, string>    // environment variables the worker may read
+  workspace?: WorkspaceHandle    // additive (ADR-0004): runtime-provisioned workspace,
+                                 // supplied by the dispatcher when a WorkerRuntime is in play
   // Intentionally minimal. No memory, no events, no other-task references.
   // Anything else the worker needs comes via TaskSpec.description.
 }
@@ -98,11 +100,19 @@ type WorkerEvent =
   | { kind: 'tool_call'; at: number; toolCallId: string; tool: string; argsPreview: string }
   | { kind: 'tool_result'; at: number; toolCallId: string; ok: boolean; resultPreview: string }
   | { kind: 'file_edit'; at: number; path: string; bytesChanged: number }
-  | { kind: 'tokens'; at: number; inputTokens: number; outputTokens: number }
+  | { kind: 'tokens'; at: number; inputTokens: number; outputTokens: number;
+      cacheCreationInputTokens?: number; cacheReadInputTokens?: number }
   | { kind: 'blocked'; at: number; reason: string; needs: string }
   | { kind: 'complete'; at: number; partial: boolean; result: unknown }
-  | { kind: 'failed'; at: number; reason: string; recoverable: boolean }
+  | { kind: 'failed'; at: number; reason: string; recoverable: boolean;
+      payload?: unknown; terminationMode?: 'sigterm' | 'sigkill' }
 ```
+
+Additive field notes (shipped in `src/workers/types.ts`, reconciled here per #22):
+
+- `tokens.cacheCreationInputTokens` / `tokens.cacheReadInputTokens` — optional cache counts from the underlying API's usage block. Workers that don't surface cache data omit them entirely rather than padding zeros (present-and-zero would falsely claim "we know there were zero cache hits").
+- `failed.payload` — optional opaque diagnostic the worker captured at failure time (e.g. the parsed result envelope when a subprocess exited 0 but reported an in-envelope error). The orchestrator treats it as diagnostic data only.
+- `failed.terminationMode` — set by workers that terminated the underlying resource themselves during `stop()`: `'sigterm'` means the child honored the graceful signal; `'sigkill'` means the grace window elapsed and force-termination was required. Absent on failures unrelated to `stop()`.
 
 - Workers MUST emit at least one event per `HEARTBEAT_INTERVAL_MS` (default 30s). If not, the orchestrator considers the worker zombied and calls `stop()`.
 - The stream MUST terminate exactly once, by emitting either `complete` or `failed`, OR by closing the iterator without either (which the orchestrator treats as `failed` with synthetic reason `stream_closed_without_terminal`).
@@ -120,6 +130,7 @@ type WorkerEvent =
 | **Hang / zombie** | No event for `HEARTBEAT_INTERVAL_MS * 3` | Orchestrator calls `stop()`. Records as `failed` with reason `zombie`. |
 | **Timeout** | `Date.now() - startedAt > timeoutMs` | Orchestrator calls `stop()`. Records as `timed_out`. |
 | **Garbage output** | Not the worker's job to detect. | Orchestrator validates against `successCriteria` post-hoc; treats as `failed` if validation rejects. |
+| **In-envelope error** (worker's underlying agent exits cleanly but reports failure in-band — e.g. Claude Code's `--output-format json` returning `is_error: true` on subprocess exit 0) | Worker parses the envelope and detects the authoritative failure signal. | Worker MUST emit `failed` (never `complete`), MAY classify `recoverable`, and SHOULD attach the parsed envelope as `failed.payload`. Distinct from "garbage output": garbage = the worker has no idea and validation is the orchestrator's job; envelope error = the worker has an authoritative signal and must surface it. Resolves #22; the silent-success variant of this bug was #17. |
 | **Partial completion** | Worker emits `complete` with `partial: true` | Treated as `complete` for accounting, but flagged in `tasks.result.partial`. Manager Agent decides whether to re-task. |
 | **Recoverable failure** | Worker emits `failed` with `recoverable: true` | Retry without escalation; non-recoverable failures escalate after N attempts. |
 | **Budget cap breach (high-fidelity worker)** | `tokens_spent_cents` exceeds `token_budget_cents` mid-run | Orchestrator calls `stop()`; per the strengthened `stop()` contract, no further `tokens` events arrive after the grace window, so the cap is honored. Records as `failed` with reason `budget_exceeded`. |
@@ -130,12 +141,17 @@ The contract is: **the worker reports what it knows; the orchestrator decides wh
 
 ## How `ClaudeCodeWorker` satisfies the interface
 
-- **Construction.** Takes a path to a base repo, a Conductor binary path, and configuration.
-- **`capabilities()`.** Returns the configured Claude model ID, max context derived from a static table, and cost from the same table. `protocolVersion` starts at 1.
-- **`start()`.** Creates a Conductor worktree, writes `TaskSpec` to a known location inside the worktree, spawns `claude` as a subprocess with structured-output flags. Returns a session handle (e.g., `claude-code:<pid>:<uuid>`).
-- **`stream()`.** Tails the subprocess's structured stdout, parses each line into a `WorkerEvent`. Anything that doesn't parse becomes a `log` event at `warn`. Emits a synthetic `heartbeat` if no upstream event in 25s.
-- **`status()`.** Checks process liveness and last-event timestamp.
-- **`stop()`.** Sends SIGTERM to the subprocess, waits `STOP_GRACE_MS`, then SIGKILL to the entire process group (to catch any subprocesses Claude Code itself spawned). This is how `ClaudeCodeWorker` honors the contract's "no further `tokens` events after grace" requirement. Cleans up the worktree (or marks it for reaping; see M3 open question).
+Present-tense description of the merged implementation (`src/workers/claude-code-worker.ts`); rewritten per #16 — the original section described a worker that was never built.
+
+- **Construction.** Zero-argument constructor (an options bag exists for test injection of the spawn function). Reads `ANTHROPIC_API_KEY` from the daemon's environment at construction and throws with a pointed message if absent (ADR-0002). It does not take a base-repo path or any Conductor configuration — workspace placement is not this layer's job (see ADR-0004).
+- **`capabilities()`.** Returns a static table: configured Claude model ID, max context, cost per million tokens. `protocolVersion` is 1.
+- **`start()`.** Builds the subprocess invocation as a pure exported function (testable without spawning), reconstructs the child env from an explicit allowlist plus the injected API key (#8/#9), passes the task prompt as a CLI argument (`claude -p --bare --output-format json <description>`), and spawns with `cwd = TaskSpec.workingDirectory`. Returns `claude-code:<pid>:<uuid>`. There is no TaskSpec file written into the workspace and no per-line streaming — see the fidelity note below.
+- **`stream()`.** Accumulates the subprocess's full stdout and parses it once at close as a result envelope. Exit 0 with `is_error: true` maps to `failed` with the envelope attached as `payload` (#17/#23); a malformed envelope (missing boolean `is_error`) is alarmed as `failed`, never passed through as success. On a successful envelope it emits one `tokens` event derived from the `usage` block (forwarding optional cache fields, #13/#25) and then `complete`. Debounced synthetic `heartbeat`s fire when nothing else has been emitted for 25s (#11/#28); `lastEventAt` updates at every yield site (#12/#28).
+- **`status()`.** Returns the session's tracked state, reason, and `lastEventAt` (lifecycle-transition test coverage is gapped — #20).
+- **`stop()`.** Idempotent; concurrent callers share one termination promise. SIGTERM to the direct child, `STOP_GRACE_MS` (10s) grace, then SIGKILL, with the outcome recorded as `terminationMode` on the synthetic `failed` event (#14/#24). Today this signals **only the direct child** — process-group escalation is #15, and lands with ADR-0004's `GitWorktreeRuntime`, which owns process placement and performs group-first signaling. Worktree cleanup is likewise ADR-0004's `teardown()`/reaper, not the worker's job.
+- **Token-reporting fidelity.** `ClaudeCodeWorker` is currently a **low-fidelity** path worker: exactly one `tokens` event at completion, derived from the result envelope. The high-fidelity path (incremental events via `--output-format stream-json`) is #26. A consequence worth naming: the worker cannot emit `blocked` or per-tool events mid-run today — whole-stdout-at-close parsing cannot observe mid-run state by construction.
+
+**Remaining implementation gaps, tracked:** #15 (process-group stop — closes with ADR-0004's runtime), #18 (non-zero-exit stdout discarded from diagnostics), #19/#20 (test-coverage gaps), #26 (stream-json upgrade), #27 (envelope-shape integration pin).
 
 ## How a future `CodexWorker` satisfies the interface
 
@@ -174,9 +190,9 @@ This interface deliberately does not promise:
 
 These are properties of `ClaudeCodeWorker` that other workers might NOT share. The interface accommodates the variation:
 
-- Claude Code emits explicit `tool_call` / `tool_result` events. Other workers may not — those would emit `log` events instead, or coarse `progress`. The orchestrator MUST NOT assume every worker emits structured tool calls.
-- Claude Code reports token usage continuously and qualifies for the high-fidelity token-reporting path. Other workers may only report at completion and run in the low-fidelity path; the interface accommodates either explicitly (see Event stream above).
-- Claude Code runs in a Conductor worktree by convention. Other workers may not use Conductor. `TaskSpec.workingDirectory` is a hint, not a contract.
+- Claude Code *can* emit explicit `tool_call` / `tool_result` events (via stream-json; the current `ClaudeCodeWorker` does not yet — see #26). Other workers may never emit them — those would emit `log` events instead, or coarse `progress`. The orchestrator MUST NOT assume every worker emits structured tool calls.
+- Claude Code *can* report token usage continuously and qualify for the high-fidelity token-reporting path; the merged `ClaudeCodeWorker` runs the **low-fidelity** path today (one `tokens` event at completion) and upgrades with #26. Other workers may only ever report at completion; the interface accommodates either explicitly (see Event stream above).
+- Claude Code workers run in runtime-provisioned git worktrees per ADR-0004 (`WorkerRuntime`/`GitWorktreeRuntime`); Conductor is not in the runtime path. Other workers may use entirely different placement. `TaskSpec.workingDirectory` is a hint, not a contract — when a runtime is in play, the dispatcher supplies the authoritative `WorkerContext.workspace`.
 - Claude Code's `partial: true` semantics map to "I stopped at the token cap with useful work done." Other workers may interpret partial differently; `tasks.result.partial` is a hint to the Manager Agent, not a typed promise.
 
 ## Open questions
