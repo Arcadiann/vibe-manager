@@ -86,6 +86,8 @@ export type ReapReport = {
   process: 'killed' | 'already-dead' | 'pid-reused-not-touched' | 'none-recorded'
   removed: boolean
   preservedSkipped: boolean
+  // Set when this workspace's reap failed; other workspaces proceed anyway.
+  error?: string
 }
 
 export interface WorkerRuntime {

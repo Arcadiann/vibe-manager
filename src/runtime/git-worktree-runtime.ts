@@ -130,11 +130,16 @@ export class GitWorktreeRuntime implements WorkerRuntime {
   #installShutdownHandlers(): void {
     if (this.#shutdownInstalled) return
     this.#shutdownInstalled = true
-    const killAll = () => {
+    // Kill workers, then RE-RAISE: installing a handler disables Node's
+    // default terminate-on-signal, and a supervisor's single graceful stop
+    // must still end the daemon (once() has already deregistered us, so the
+    // re-raise takes the default path).
+    const killAllAndReraise = (sig: NodeJS.Signals) => {
       for (const h of this.#live) h.signal('SIGKILL', { group: true })
+      process.kill(process.pid, sig)
     }
-    process.once('SIGINT', killAll)
-    process.once('SIGTERM', killAll)
+    process.once('SIGINT', () => killAllAndReraise('SIGINT'))
+    process.once('SIGTERM', () => killAllAndReraise('SIGTERM'))
   }
 
   async createWorkspace(spec: WorkspaceSpec): Promise<WorkspaceHandle> {
@@ -172,15 +177,24 @@ export class GitWorktreeRuntime implements WorkerRuntime {
         throw new Error(`workspace directory already exists: ${dir} — reap leftovers first`)
       }
       await git(['worktree', 'add', '-b', branch, dir, spec.baseRef], spec.baseRepoPath)
-      const meta: WorkspaceMeta = {
-        id,
-        taskId: spec.taskId,
-        branch,
-        baseRepoPath: spec.baseRepoPath,
-        createdAt: new Date().toISOString(),
+      try {
+        const meta: WorkspaceMeta = {
+          id,
+          taskId: spec.taskId,
+          branch,
+          baseRepoPath: spec.baseRepoPath,
+          createdAt: new Date().toISOString(),
+        }
+        await mkdir(join(dir, '.vibe'), { recursive: true })
+        await writeFile(join(dir, '.vibe', 'workspace.json'), JSON.stringify(meta, null, 2))
+      } catch (err) {
+        // Roll back: a worktree without workspace.json is invisible to
+        // listWorkspaces/reap but its branch blocks every retry — the worst
+        // of both. Best-effort removal, then surface the original error.
+        await git(['worktree', 'remove', '--force', dir], spec.baseRepoPath).catch(() => {})
+        await git(['branch', '-D', branch], spec.baseRepoPath).catch(() => {})
+        throw err
       }
-      await mkdir(join(dir, '.vibe'), { recursive: true })
-      await writeFile(join(dir, '.vibe', 'workspace.json'), JSON.stringify(meta, null, 2))
       return { id, path: dir, branch }
     })
   }
@@ -279,14 +293,29 @@ export class GitWorktreeRuntime implements WorkerRuntime {
     // Same pid-identity validation as the reaper: a recorded pid whose start
     // time no longer matches is a REUSED pid and must never be signaled or
     // waited on (the wait would block on an innocent process).
+    // Foreign-handle guard: unmanaged handles and paths outside the runtime
+    // root must never reach the rm/worktree-remove machinery below — the
+    // meta-unreadable fallback is `rm -rf ws.path`, which against an
+    // unmanaged handle would delete the operator's directory.
+    if (ws.id.startsWith('unmanaged:') || !ws.path.startsWith(this.#root + '/')) {
+      throw new Error(`refusing to tear down non-runtime-managed workspace: ${ws.id} (${ws.path})`)
+    }
     const proc = await this.#readProc(ws.path)
-    if (proc && (await this.#verifyRecordedProcess(proc)) === 'alive') {
-      const deadline = Date.now() + TEARDOWN_GROUP_WAIT_MS
-      while (groupAlive(proc.pgid) && Date.now() < deadline) await sleep(100)
-      if (groupAlive(proc.pgid)) {
-        trySignal(-proc.pgid, 'SIGKILL')
-        await sleep(200)
+    if (proc) {
+      const verdict = await this.#verifyRecordedProcess(proc)
+      if (verdict === 'alive') {
+        const deadline = Date.now() + TEARDOWN_GROUP_WAIT_MS
+        while (groupAlive(proc.pgid) && Date.now() < deadline) await sleep(100)
+        if (groupAlive(proc.pgid)) {
+          trySignal(-proc.pgid, 'SIGKILL')
+          await sleep(200)
+        }
+      } else if (verdict === 'dead') {
+        // Leader gone but grandchildren may survive in the group; removal
+        // must not race their writes into the directory.
+        await this.#killSurvivorGroup(proc.pgid)
       }
+      // 'reused': identity unverifiable — never signal.
     }
     if (opts.preserve) {
       await writeFile(join(ws.path, '.vibe', 'preserved'), new Date().toISOString()).catch(() => {})
@@ -339,32 +368,50 @@ export class GitWorktreeRuntime implements WorkerRuntime {
         })
         continue
       }
-      let processOutcome: ReapReport['process'] = 'none-recorded'
-      const proc = await this.#readProc(ws.path)
-      if (proc) {
-        const verdict = await this.#verifyRecordedProcess(proc)
-        if (verdict === 'dead') {
-          processOutcome = 'already-dead'
-        } else if (verdict === 'reused') {
-          // Same pid, different birth — the OS recycled it. Do not signal.
-          processOutcome = 'pid-reused-not-touched'
-        } else {
-          trySignal(-proc.pgid, 'SIGKILL')
-          const deadline = Date.now() + TEARDOWN_GROUP_WAIT_MS
-          while (groupAlive(proc.pgid) && Date.now() < deadline) await sleep(100)
-          processOutcome = 'killed'
+      // Per-workspace error isolation: reap is layer 3 of orphan safety and
+      // runs at daemon start — one poisoned workspace (EBUSY, submodule,
+      // foreign lock) must not abort recovery for the rest.
+      try {
+        let processOutcome: ReapReport['process'] = 'none-recorded'
+        const proc = await this.#readProc(ws.path)
+        if (proc) {
+          const verdict = await this.#verifyRecordedProcess(proc)
+          if (verdict === 'dead') {
+            // Leader gone; grandchildren may survive in the group.
+            processOutcome = (await this.#killSurvivorGroup(proc.pgid))
+              ? 'killed'
+              : 'already-dead'
+          } else if (verdict === 'reused') {
+            // Same pid, different birth — the OS recycled it. Do not signal.
+            processOutcome = 'pid-reused-not-touched'
+          } else {
+            trySignal(-proc.pgid, 'SIGKILL')
+            const deadline = Date.now() + TEARDOWN_GROUP_WAIT_MS
+            while (groupAlive(proc.pgid) && Date.now() < deadline) await sleep(100)
+            processOutcome = 'killed'
+          }
         }
+        if (meta?.baseRepoPath) baseRepos.add(meta.baseRepoPath)
+        await this.teardown(ws)
+        reports.push({
+          workspaceId: ws.id,
+          taskId: meta?.taskId ?? null,
+          path: ws.path,
+          process: processOutcome,
+          removed: true,
+          preservedSkipped: false,
+        })
+      } catch (err) {
+        reports.push({
+          workspaceId: ws.id,
+          taskId: meta?.taskId ?? null,
+          path: ws.path,
+          process: 'none-recorded',
+          removed: false,
+          preservedSkipped: false,
+          error: String(err),
+        })
       }
-      if (meta?.baseRepoPath) baseRepos.add(meta.baseRepoPath)
-      await this.teardown(ws)
-      reports.push({
-        workspaceId: ws.id,
-        taskId: meta?.taskId ?? null,
-        path: ws.path,
-        process: processOutcome,
-        removed: true,
-        preservedSkipped: false,
-      })
     }
     for (const repo of baseRepos) {
       if (existsSync(join(repo, '.git'))) {
@@ -376,11 +423,27 @@ export class GitWorktreeRuntime implements WorkerRuntime {
 
   // Pid-identity check shared by teardown and reap: 'alive' only when the
   // recorded pid exists AND its start time matches what we recorded at spawn.
+  // An EMPTY recorded start time means the identity is unverifiable (child
+  // died before `ps` ran, or `ps -o lstart=` unsupported) — treat as
+  // 'reused', i.e. never signal: an inverted guard that kills whatever wears
+  // the pid today is worse than a leaked process.
   async #verifyRecordedProcess(proc: ProcMeta): Promise<'alive' | 'dead' | 'reused'> {
     const currentStart = await processStartTime(proc.pid)
     if (currentStart === '') return 'dead'
-    if (proc.startTime !== '' && currentStart !== proc.startTime) return 'reused'
+    if (proc.startTime === '' || currentStart !== proc.startTime) return 'reused'
     return 'alive'
+  }
+
+  // Leader-dead-group-alive recovery: POSIX guarantees a pgid is not recycled
+  // while the group has members, so when the recorded LEADER is gone but
+  // kill(-pgid, 0) still lands, the survivors are OUR grandchildren — the
+  // exact population #15 is about. Kill the group and wait briefly.
+  async #killSurvivorGroup(pgid: number): Promise<boolean> {
+    if (!groupAlive(pgid)) return false
+    trySignal(-pgid, 'SIGKILL')
+    const deadline = Date.now() + TEARDOWN_GROUP_WAIT_MS
+    while (groupAlive(pgid) && Date.now() < deadline) await sleep(100)
+    return true
   }
 
   async #readMeta(wsPath: string): Promise<WorkspaceMeta | null> {

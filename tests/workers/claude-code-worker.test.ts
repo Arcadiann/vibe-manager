@@ -514,6 +514,45 @@ describe('ClaudeCodeWorker — stop() lifecycle (CI, closes #14, group semantics
     assert.equal(signalCount, 0, 'no signal should be sent after natural termination')
   })
 
+  it('child traps SIGTERM and exits 0 with a valid envelope → stream still fails, NO tokens after stop() (ADR-0001 stop contract)', async () => {
+    // The budget-cap scenario: stop() fires, the child flushes a successful
+    // envelope and exits 0. tokens+complete here would bill past the cap and
+    // mark a cancelled task complete.
+    const envelope = {
+      type: 'result', subtype: 'success', is_error: false, result: 'OK',
+      usage: { input_tokens: 100, output_tokens: 100 },
+    }
+    const h = controllableHandle({ onSigterm: 'ignore' })
+    const worker = workerWith(h)
+    const handle = await worker.start(makeSpec(), ctx)
+    const stopPromise = worker.stop(handle, 'budget cap')
+    // Child "handles" SIGTERM by writing its result and exiting 0.
+    ;(h.stdout as Readable).push(JSON.stringify(envelope))
+    queueMicrotask(() => h.fireExit(0, null))
+    await stopPromise
+    const events: WorkerEvent[] = []
+    for await (const ev of worker.stream(handle)) {
+      events.push(ev)
+      if (ev.kind === 'complete' || ev.kind === 'failed') break
+    }
+    assert.equal(events.find((e) => e.kind === 'tokens'), undefined, 'no tokens after stop() resolves')
+    const terminal = events[events.length - 1]!
+    assert.equal(terminal.kind, 'failed', 'a cancelled session must never terminate complete')
+    const status = await worker.status(handle)
+    assert.equal(status.state, 'cancelled')
+  })
+
+  it('status() agrees with the stream on envelope failures — is_error on exit 0 is failed on BOTH channels (#17 class)', async () => {
+    const envelope = { type: 'result', subtype: 'error_max_turns', is_error: true, result: 'rate limited' }
+    const worker = workerWith(fakeHandle({ stdout: JSON.stringify(envelope), exitCode: 0 }))
+    const handle = await worker.start(makeSpec(), ctx)
+    const ev = await drainTerminal(worker, handle)
+    assert.equal(ev.kind, 'failed')
+    const status = await worker.status(handle)
+    assert.equal(status.state, 'failed', 'status() must not report complete when the stream reported failed')
+    assert.equal(status.reason, 'rate limited')
+  })
+
   it('stop() called mid-spawn (no pid) → resolves once spawn settles, no error on spawn failure', async () => {
     const h = controllableHandle({ pid: null })
     const worker = workerWith(h)

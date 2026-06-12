@@ -258,6 +258,11 @@ export class ClaudeCodeWorker implements WorkerAgent {
     const apiKey = resolveApiKey(ctx, this.#apiKey)
     const execSpec = buildExecSpec(spec, apiKey)
     const ws = ctx.workspace ?? unmanagedWorkspace(spec)
+    // ADR-0001: workingDirectory is a hint, not a contract — when the
+    // dispatcher provisioned a workspace, the workspace IS the cwd. Leaving
+    // spec.workingDirectory in place here would run the agent outside the
+    // worktree while proc.json/teardown operate on the unused worktree.
+    if (ctx.workspace) delete execSpec.cwd
     const exec = await this.#runtime.exec(ws, execSpec)
 
     const handle: SessionHandle = `claude-code:${exec.pid ?? 'nopid'}:${randomUUID()}`
@@ -348,6 +353,10 @@ export class ClaudeCodeWorker implements WorkerAgent {
 
     const scheduleHeartbeat = () => {
       if (timer !== undefined) clearTimeout(timer)
+      // Don't arm after a terminal state: a late driveCompletion enqueue
+      // (consumer broke early) would otherwise hold the event loop open for
+      // one stray 25s tick.
+      if (session.state !== 'running' && session.state !== 'starting') return
       timer = setTimeout(() => {
         timer = undefined
         // Guard per §"heartbeat must NOT yield while stop() is in flight":
@@ -373,21 +382,52 @@ export class ClaudeCodeWorker implements WorkerAgent {
       wakeNow()
     }
 
+    // Terminal events must also land on session state so status() (the
+    // orchestrator's reconciliation channel, ADR-0001) agrees with the
+    // stream: an is_error envelope on exit 0 is `failed` on BOTH channels —
+    // the silent-success class (#17) must not resurface via status().
+    const finalize = (state: 'complete' | 'failed', reason: string | null) => {
+      if (session.state === 'cancelled') return
+      session.state = state
+      session.reason = reason
+    }
+
+    const failTerminal = (ev: Extract<WorkerEvent, { kind: 'failed' }>) => {
+      finalize('failed', ev.reason)
+      enqueue(ev)
+      finish()
+    }
+
     const driveCompletion = async () => {
       const { exit, stdout, stderr } = await session.resolved
       const at = Date.now()
+      // ADR-0001's strengthened stop() contract: after stop() resolves, no
+      // further `tokens` events. A child that traps SIGTERM and exits 0 with
+      // a valid envelope must still terminate this stream as `failed` —
+      // never tokens+complete on a cancelled session.
+      if (session.state === 'cancelled') {
+        const failed: Extract<WorkerEvent, { kind: 'failed' }> = {
+          kind: 'failed',
+          at,
+          reason: session.reason ?? 'stopped by orchestrator',
+          recoverable: false,
+        }
+        if (session.terminationMode) failed.terminationMode = session.terminationMode
+        enqueue(failed)
+        finish()
+        return
+      }
       if (exit.exitCode === 0) {
         let parsed: unknown
         try {
           parsed = JSON.parse(stdout)
         } catch (err) {
-          enqueue({
+          failTerminal({
             kind: 'failed',
             at,
             reason: `unparseable subprocess stdout: ${(err as Error).message}`,
             recoverable: false,
           })
-          finish()
           return
         }
         // Closes #17: subprocess exit 0 is NOT the same as task success when
@@ -403,21 +443,20 @@ export class ClaudeCodeWorker implements WorkerAgent {
           ? envelope.is_error
           : undefined
         if (typeof isError !== 'boolean') {
-          enqueue({
+          failTerminal({
             kind: 'failed',
             at,
             reason: 'subprocess result envelope missing boolean is_error field',
             recoverable: false,
             payload: parsed,
           })
-          finish()
           return
         }
         if (isError) {
           const errText = typeof envelope!.result === 'string' && envelope!.result.length > 0
             ? envelope!.result
             : 'subprocess reported is_error without error text'
-          enqueue({
+          failTerminal({
             kind: 'failed',
             at,
             reason: errText,
@@ -428,7 +467,6 @@ export class ClaudeCodeWorker implements WorkerAgent {
             recoverable: false,
             payload: parsed,
           })
-          finish()
           return
         }
         // Closes #13: emit one `tokens` event from the successful envelope's
@@ -447,6 +485,7 @@ export class ClaudeCodeWorker implements WorkerAgent {
             message: `subprocess result envelope usage block malformed: ${tokens.reason}`,
           })
         }
+        finalize('complete', null)
         enqueue({ kind: 'complete', at, partial: false, result: parsed })
         finish()
       } else {
@@ -461,8 +500,7 @@ export class ClaudeCodeWorker implements WorkerAgent {
           recoverable: false,
         }
         if (session.terminationMode) failed.terminationMode = session.terminationMode
-        enqueue(failed)
-        finish()
+        failTerminal(failed)
       }
     }
 
